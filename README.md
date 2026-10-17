@@ -303,7 +303,7 @@ position would still scan to the end of the run.
 | Rule | Hostile input | Before | Now |
 |---|---|---|---|
 | `email` | 20 KB of letters or base64, no `@` | 0.7 s (1 MB ≈ 30 min) | 1 MB in 16 ms (lookbehind) |
-| `jwt` | `eyJeyJeyJ…` | 50 KB in 1.75 s | same shape of problem, fixed together with the JWT report (3f); strict xfail test until then |
+| `jwt` | `eyJeyJeyJ…` | 60 KB in 2.3 s | 60 KB in 0.8 ms (lookbehind + possessive, see [The JWT report](#the-jwt-report)) |
 
 Every other rule grows linearly (1 MB of the worst shape takes under a second), and the tests
 time the worst cases so a regression shows up. Go's RE2 engine guarantees linear time by
@@ -337,6 +337,7 @@ none in code:
 | `pii-fields` key rule: `ssn`, `phone`, `dob` and similar names, mask | Sample line 37. A field *named* `phone` is a phone number, so matching on the name has almost no false positives. |
 | `url-credentials` value rule, `(?<=://)[^/\s:@]+:[^/\s@]+(?=@)`, mask, placed **before** `email` | `postgres://admin:hunter2@db:5432/app` leaked: no rule covered it. With a host like `db.internal` the email rule hashed `hunter2@db.internal` by accident, leaving the user name readable and the password open to guessing. Now the result is `postgres://****@db:5432/app`. The `://` lookbehind pins each match to the start of a URL, which also keeps it linear. A URL with only a user name (`https://user@host`) is left alone. |
 | `email` pattern gets the lookbehind `(?<![A-Za-z0-9._%+-])` | Same matches, but linear instead of quadratic time (see [Regexes are part of the time complexity](#regexes-are-part-of-the-time-complexity)). |
+| `jwt` pattern uses the base64url alphabet, a lookbehind and possessive quantifiers | The user report: base64url tokens leaked whole or in part (sample lines 11, 15, 16), and the pattern was quadratic. See [The JWT report](#the-jwt-report). |
 
 Why the card pattern lists layouts instead of "digits with optional separators": a loose
 `(\d[ -]?){12,18}\d` on `"id 1 4111 1111 1111 1111"` starts matching at the `1`, takes 17
@@ -524,13 +525,117 @@ harder to trust. The cost can be cut without giving up the fidelity (see
 
 ## The JWT report
 
-<!--
-Phase 3f, not done yet. Tell it as a short debugging story:
-- Symptom: what users reported
-- Reproduction: which sample lines show it (11, 15, 16), and the failing test (tests/test_known_gaps.py)
-- Root cause
-- Fix: what changed in rules.yaml (link the commit)
--->
+> Users reported that the provided `rules.yaml` misses some JWTs seen in production samples.
+
+as we can see in the lines (output of the provided rules):
+
+```
+11 - {"ts":"2025-01-15T10:00:10Z","method":"POST","path":"/oauth/token","headers":{},"body":{"grant_type":"password"},"response":{"status":200,"headers":{"Content-Type":"application/json"},"body":"{\"access_token\":\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhIjoiPz8_In0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk\",\"expires_in\":3600}"}}
+
+15 - {"ts":"2025-01-15T10:00:14Z","method":"POST","path":"/v1/sso","headers":{},"body":{"id_token":"****_adQssw5c","note":"forwarded header was Bearer ****_adQssw5c"},"response":{"status":200,"headers":{},"body":null}}
+
+16 - {"ts":"2025-01-15T10:00:15Z","method":"POST","path":"/v1/session/refresh","headers":{},"body":{"msg":"session eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhIjoiPz8_In0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk expired, retry"},"response":{"status":401,"headers":{},"body":null}}
+```
+
+there is a problem with the JWT rule, the regex doesnt cover the whole JWT cases and causes leaks.
+To fix that we need to change the rule of the JWT to include all of the possible options.
+
+Lines 11 and 16 leak the **whole** token, line 15 leaks the end of its signature. The per-rule
+summary showed it too: `jwt 2`, both on line 15. Lines 11 and 16 weren't matched at all.
+
+### Root cause: two bugs in one pattern
+
+```yaml
+pattern: 'eyJ[A-Za-z0-9+/=]+\.[A-Za-z0-9+/=]+\.[A-Za-z0-9+/=]*'
+```
+
+**1. Wrong alphabet (the leak).** A JWT is three parts joined by dots, each **base64url**
+encoded (RFC 7515): the alphabet is `A-Z a-z 0-9 - _`, with no `=` padding. The class
+`[A-Za-z0-9+/=]` is plain base64 (`+ /` instead of `- _`). About one base64url character in 32
+is a `-` or `_`, so most real tokens contain one, and the match stops there:
+
+- `_` in the **signature** (line 15): the pattern still matches up to the `_` and masks that
+  much, so `****_adQssw5c` leaks the tail.
+- `_` in the **payload** (lines 11 and 16, `eyJhIjoiPz8_In0`): the second part stops at the `_`,
+  the `\.` that must follow can't match, and the whole pattern fails. Nothing is masked.
+
+**2. Quadratic time (the same shape as the email bug in
+[Regexes are part of the time complexity](#regexes-are-part-of-the-time-complexity)).** On
+`eyJeyJeyJ…`, `re` tries a match at every `eyJ`. From each one, `[…]+` runs to the end of the
+text, finds no `.`, and gives the characters back one by one: *n* starts × O(*n*) = O(n²). 60 KB
+took 2.3 s. Fixing the alphabet alone doesn't change this (2.26 s, measured).
+
+### The fix (only `rules.yaml` changed)
+
+```yaml
+pattern: '(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]++\.[A-Za-z0-9_-]++\.[A-Za-z0-9_-]*+'
+```
+
+| Part | Why |
+|---|---|
+| `[A-Za-z0-9_-]` | the base64url alphabet, from the spec. I first kept `+/=` too, "to be safe", and that broke `token=eyJ…`: with `=` in the class, the lookbehind below saw `=` as part of the run and refused the match. |
+| `(?<![A-Za-z0-9_-])` | a token may start only where a run of base64url characters starts. On `eyJeyJ…` only the first `eyJ` is tried; every other position fails this O(1) check. |
+| `++` (possessive) | once taken, characters are never given back, so a failed attempt costs one pass, not a give-back walk. Python 3.11+, which `pyproject.toml` requires. |
+| `*+` on the last part | an unsigned token (`alg: none`) has an empty third part and must still be masked. |
+
+| | Before | After |
+|---|---|---|
+| Lines 11, 15, 16 | 2 whole tokens leaked, 1 tail leaked | all `****` |
+| `jwt` count on `input.ndjson` | 2 | 4 |
+| 60 KB of `eyJeyJ…` | 2.3 s | 0.8 ms |
+
+The engine didn't change: the rules are config, so the fix is config. In Kubernetes it ships as
+a ConfigMap update and a rollout restart, with no new image.
+
+**Tests.** The three expected-failure tests in `tests/test_known_gaps.py` now pass and became
+normal tests in `tests/test_value_rules.py`: the tokens from lines 11, 15 and 16, a token after
+`=` and in quotes, an unsigned token, look-alikes that must stay (`keyJSON.a.b`, a token with
+only two parts), and three hostile shapes of 300 to 500 KB that must each take under a second. The golden
+file `tests/fixtures/sample_expected.ndjson` now covers the whole of `input.ndjson`. Before the
+fix it skipped lines 11, 15 and 16, so it couldn't bless a leak.
+
+### Why not a detector in code instead of a regex
+
+I could replace the rule with a Python function: find `eyJ`, base64url-decode the header, and
+check that it is JSON with an `alg` field. I kept the regex:
+
+- **The brief makes rules config.** The report is about `rules.yaml`, and a config bug fixed in
+  config means no engine change and no new image. A code detector would also make `jwt` the one
+  rule a user can't read or change in `rules.yaml`.
+- **For a redactor, a miss is worse than a false mask.** The decode check exists to reject
+  look-alikes, but it would also reject what we most need to catch: a token that an upstream
+  logger cut short, or one with a damaged header. That would be a leak. A false mask costs a little
+  readability. Text shaped like `eyJ….….…` is almost never anything but a JWT anyway: `eyJ` is
+  `{"` in base64.
+- **The cost is the same.** Both are one linear pass. The decoder adds a base64 decode and a
+  JSON parse per candidate.
+
+### The trade-off: a JWT glued to a word isn't matched
+
+The lookbehind lets a token start only where a run of base64url characters starts. For the
+email rule that loses nothing (see
+[Regexes are part of the time complexity](#regexes-are-part-of-the-time-complexity)), because any character of a run
+can be part of the address, so the leftmost match always starts at the run's beginning. A JWT is
+different: it starts with the fixed text `eyJ`, and that can sit *inside* a run.
+
+In `jwt_eyJhbGci….….…`, `_` is a base64url character, so the run starts at `j`. The `eyJ` has `_`
+before it, the lookbehind refuses, and the token isn't masked at all. The provided pattern had
+no lookbehind, so it didn't have this blind spot, only the bigger ones above. The same goes for a
+token glued to a letter, a digit or `-`.
+
+The alternatives I measured:
+
+| Option | `jwt_eyJ…` | Hostile input | Price |
+|---|---|---|---|
+| **Lookbehind on all of base64url** (chosen) | not masked | linear (0.8 ms) | glued tokens leak |
+| Lookbehind on letters and digits only | masked | `_eyJ_eyJ…`: 80 KB in 1.2 s, **quadratic again** | a DoS hole |
+| Match the whole run if it contains `eyJ` | masked, together with `jwt_` | linear | false masks: `keyJSON.a.b` is masked, since "keyJSON" contains `eyJ` |
+
+I chose the first. In real traffic a JWT follows a space, a quote, `=`, `:` or `Bearer `, never a
+base64url character, and a slow pattern in a service is an outage for everyone. The trade-off is
+listed under [Known limitations](#known-limitations) with a strict expected-failure test
+(`test_jwt_glued_to_a_word`), so it can't be fixed or broken silently. If glued tokens turn up
+in production, the third option is the fix: a slightly wider mask instead of a leak.
 
 ## Deployment
 
@@ -625,9 +730,8 @@ sense with hot reload, where the rules could change while the pod is running.
 Each leak below has a strict expected-failure test in `tests/test_known_gaps.py`. If one gets
 fixed, its test fails until the marker is removed, so this list can't silently go stale.
 
-- **JWTs in base64url are only partly masked** (sample lines 11, 15, 16), and the `jwt`
-  pattern is **quadratic** on input like `eyJeyJeyJ…`. This is the user report, to be fixed in
-  its own commit (Phase 3f).
+- **A JWT glued to a letter, digit, `_` or `-`** (`jwt_eyJ…`) isn't masked. This is the price
+  of a linear `jwt` rule (see [the trade-off](#the-trade-off-a-jwt-glued-to-a-word-isnt-matched)).
 - **Percent-encoding and HTML entities inside a sentence** aren't decoded:
   `see email=gina%40example.com for details` and `<p>alice&#64;example.com</p>` keep the email.
   Percent-encoding *is* decoded when the whole string is a form body or a URL. Decoding single

@@ -76,8 +76,14 @@ data:
         pattern: '(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
         action: hash
 
+      # A JWT is three base64url parts (A-Z a-z 0-9 - _, no "=" padding) joined by dots; the header
+      # always starts with eyJ, which is {" encoded. The old class [A-Za-z0-9+/=] was plain base64, so
+      # matching stopped at the first "-" or "_" and leaked the rest of the token. The lookbehind lets a
+      # token start only where a run of base64url characters starts, and the possessive ++ never gives
+      # characters back: without them "eyJeyJeyJ..." was retried from every eyJ, O(n^2). The empty
+      # third part allowed by *+ is an unsigned token (alg "none").
       - name: jwt
-        pattern: 'eyJ[A-Za-z0-9+/=]+\.[A-Za-z0-9+/=]+\.[A-Za-z0-9+/=]*'
+        pattern: '(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]++\.[A-Za-z0-9_-]++\.[A-Za-z0-9_-]*+'
         action: mask
 
       # 13-19 digits written together, or a card printed in groups: 4-4-4-4 (Visa, Mastercard,

@@ -14,27 +14,15 @@ from conftest import redact_body
 def gap(phase, reason):
     return pytest.mark.xfail(strict=True, reason=f"{phase}: {reason}")
 
-# --- the JWT report (fixed in its own commit, Phase 3f) -------------------------------
-
-@gap("3f", "jwt pattern uses base64 (+/=) but JWTs use base64url (-_)")
-@pytest.mark.parametrize("secret_part", ["_adQssw5c", "dBjftJeZ4CVP"])
-def test_base64url_jwt_is_fully_redacted(redactor, secret_part):
-    text = (
-        "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c "
-        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhIjoiPz8_In0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
-    )
-    assert secret_part not in redact_body(redactor, text)
-
-@gap("3f", "jwt pattern retries from every 'eyJ' and rescans to the end: O(n^2) on hostile input")
-def test_jwt_rule_is_linear_on_hostile_input(redactor):
-    import time
-
-    start = time.perf_counter()
-    redact_body(redactor, "eyJ" * 20_000)  # 60 KB: about 2.5 s today, milliseconds once fixed
-    assert time.perf_counter() - start < 0.5
-
 
 # --- accepted limitations (documented, not planned) ----------------------------------
+
+@gap("limit", "a JWT glued to a letter, digit, '_' or '-' isn't matched: the price of a linear jwt rule")
+def test_jwt_glued_to_a_word(redactor):
+    assert "dBjftJeZ4CVP" not in redact_body(
+        redactor, "jwt_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhIjoiPz8_In0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    )
+
 
 @gap("limit", "percent-encoding is only decoded in a whole form body or URL, not inside a sentence")
 def test_percent_encoded_email_in_a_sentence(redactor):

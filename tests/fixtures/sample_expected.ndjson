@@ -8,15 +8,18 @@
 {"ts":"2025-01-15T10:00:07Z","method":"POST","path":"/login","headers":{"Content-Type":"application/x-www-form-urlencoded"},"body":"email=sha256:5ff860bf1190596c7188ab851db691f0f3169c453936e9e1eba2f9a47f7a0018&password=****&card=************1111&remember=on","response":{"status":302,"headers":{"Location":"/home"},"body":""}}
 {"ts":"2025-01-15T10:00:08Z","method":"POST","path":"/v1/tickets","headers":{"Content-Type":"text/plain"},"body":"Hi team,\nplease reset the account for sha256:7b34211350ff567970974e1e2b98d319a601969e74fd1a957bc889b8332d00eb. Temporary key: ****. Thanks!","response":{"status":202,"headers":{},"body":null}}
 {"ts":"2025-01-15T10:00:09Z","method":"POST","path":"/v1/legacy","headers":{"Content-Type":"application/json"},"body":"{\"email\":\"sha256:e0d47ca1bc1eb62e650fc1fd660a9bfbf7cba8dc6337d81df7ea9aa9071a24a5\",\"password\":\"****\",\"profile\":{\"card\":\"************4444\"}}","response":{"status":200,"headers":{},"body":null}}
+{"ts":"2025-01-15T10:00:10Z","method":"POST","path":"/oauth/token","headers":{},"body":{"grant_type":"password"},"response":{"status":200,"headers":{"Content-Type":"application/json"},"body":"{\"access_token\":\"****\",\"expires_in\":3600}"}}
 {"ts":"2025-01-15T10:00:11Z","method":"POST","path":"/v1/users","headers":{"Authorization":"****","X-Api-Key":"****"},"body":{"user":{"email":"sha256:7b34211350ff567970974e1e2b98d319a601969e74fd1a957bc889b8332d00eb","card_number":"************1111","password":"****"}},"response":{"status":200,"headers":{},"body":null}}
 {"ts":"2025-01-15T10:00:12Z","method":"POST","path":"/v1/users","headers":{},"body":{"password":null,"secret":"****","api_key":"sha256:5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9","token":false,"pwd":[],"email":null,"card_number":""},"response":{"status":400,"headers":{},"body":null}}
 {"ts":"2025-01-15T10:00:13Z","method":"GET","path":"/v1/items","headers":{"x-api-key":"sha256:219502a88b4d91eca29934edfe68f7a1a70e0169ada07d1f20715507a10bb9de","X-API-KEY":"sha256:a59de4005ec23404874a8857151e780cc24b702b4796a3aaf767d8f97e8ef295","Cookie":"****","AUTHORIZATION":"****"},"body":null,"response":{"status":200,"headers":{},"body":[]}}
+{"ts":"2025-01-15T10:00:14Z","method":"POST","path":"/v1/sso","headers":{},"body":{"id_token":"****","note":"forwarded header was Bearer ****"},"response":{"status":200,"headers":{},"body":null}}
+{"ts":"2025-01-15T10:00:15Z","method":"POST","path":"/v1/session/refresh","headers":{},"body":{"msg":"session **** expired, retry"},"response":{"status":401,"headers":{},"body":null}}
 {"ts":"2025-01-15T10:00:16Z","method":"PUT","path":"/v1/upload","headers":{"Content-Type":"application/octet-stream"},"body":"\u0000\u0001\u0002�ÿ\u0000PK\u0003\u0004","response":{"status":200,"headers":{"Content-Type":"application/octet-stream"},"body":"UEsDBBQAAAAIAA=="}}
 {"ts":"2025-01-15T10:00:17Z","method":"POST","path":"/v1/empty","headers":{},"body":[],"response":{"status":200,"headers":{},"body":{}}}
-{"redactor_error":{"line":17,"reason":"invalid JSON"}}
-{"redactor_error":{"line":18,"reason":"invalid JSON"}}
-{"redactor_error":{"line":20,"reason":"not a JSON object"}}
-{"redactor_error":{"line":21,"reason":"not a JSON object"}}
+{"redactor_error":{"line":20,"reason":"invalid JSON"}}
+{"redactor_error":{"line":21,"reason":"invalid JSON"}}
+{"redactor_error":{"line":23,"reason":"not a JSON object"}}
+{"redactor_error":{"line":24,"reason":"not a JSON object"}}
 {"ts":"2025-01-15T10:00:25Z","method":"POST","path":"/v1/dup","headers":{},"body":{"email":"sha256:f7faa8d2b759b8e4a6f0577503650137cf17a7f2e8408fc7f7bdb3c556dfdcf0","email":"sha256:27b677683f02ace63b1225173599516abb50f1576c5bd3904eb648eb90e6ab71"},"response":{"status":200,"headers":{},"body":null}}
 {"ts":"2025-01-15T10:00:26Z","method":"POST","path":"/v1/bulk","headers":{},"body":{"users":[{"name":"u1","password":"****"},{"name":"u2","password":"****"},{"name":"u3"}]},"response":{"status":200,"headers":{},"body":null}}
 {"ts":"2025-01-15T10:00:27Z","method":"POST","path":"/v1/keys","headers":{},"body":{"Password":"****","PASSWORD":"****","ApiKey":"sha256:2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6","api-key":"sha256:18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4","X-API-Key":"sha256:3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea","Client_Secret":"****"},"response":{"status":200,"headers":{},"body":null}}
@@ -42,4 +45,4 @@
 {"ts":"2025-01-15T10:00:47Z","method":"POST","path":"/v1/rtl","headers":{},"body":{"note":"מספר כרטיס: ************1111 אימייל: sha256:b4c9a289323b21a01c3e940f150eb9b8c542587f1abfd8f0e1cc1ffc5e475514"},"response":{"status":200,"headers":{},"body":null}}
 {"ts":"2025-01-15T10:00:48Z","method":"POST","path":"/v1/settings","headers":{},"body":{"password_hint":"first pet","passwordless":true,"tokenizer":"bpe","secret_santa":"Ann"},"response":{"status":200,"headers":{},"body":null}}
 {"ts":"2025-01-15T10:00:49Z","method":"GET","path":"/v1/status","headers":{"Accept":"*/*"},"body":null,"response":{"status":200,"headers":{},"body":{"status":"ok","uptime":12345}}}
-{"redactor_error":{"line":47,"reason":"invalid JSON"}}
+{"redactor_error":{"line":50,"reason":"invalid JSON"}}

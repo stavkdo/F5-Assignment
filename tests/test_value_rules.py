@@ -73,6 +73,39 @@ def test_jwt_runs_before_credit_card(redactor):
     assert redactor.counts["credit-card"] == 0
 
 
+# The JWT report (Phase 3f): the tokens from input lines 11, 15 and 16 contain "-" and "_"
+# (base64url), which the old pattern's base64 class stopped at.
+JWT_LINE_15 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+JWT_LINE_16 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhIjoiPz8_In0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+
+@pytest.mark.parametrize("text, expected", [
+    (f"Bearer {JWT_LINE_15}", "Bearer ****"),  # "_" in the signature: the tail used to leak
+    (f"session {JWT_LINE_16} expired", "session **** expired"),  # "_" in the payload: nothing was masked
+    (f'"{JWT_LINE_16}"', '"****"'),
+    (f"token={JWT_LINE_16}&x=1", "token=****&x=1"),
+    ("eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.", "****"),  # unsigned (alg none): empty third part
+])
+def test_base64url_jwts_are_fully_masked(redactor, text, expected):
+    assert text_out(redactor, text) == expected
+
+
+@pytest.mark.parametrize("text", ["eyJhbGciOiJIUzI1NiJ9", "eyJhbGciOiJIUzI1NiJ9.only-two", "keyJSON.a.b"])
+def test_jwt_lookalikes_stay(redactor, text):
+    assert text_out(redactor, text) == text
+
+
+@pytest.mark.parametrize("body", ["eyJ" * 100_000, "_eyJ" * 100_000, "eyJa." * 100_000], ids=["eyJ", "_eyJ", "eyJa."])
+def test_jwt_rule_is_linear_on_hostile_input(redactor, body):
+    # The old pattern retried from every eyJ and rescanned to the end of the run: 60 KB took
+    # 2.3 s. The lookbehind and the possessive ++ in rules.yaml make it one pass.
+    import time
+
+    start = time.perf_counter()
+    redact_body(redactor, body)
+    assert time.perf_counter() - start < 1.0
+
+
 @pytest.mark.parametrize("text, expected", [
     ("💳4111111111111111💳", "💳************1111💳"),  # input line 46
     ("😀zed@example.com😀", f"😀{sha256('zed@example.com')}😀"),

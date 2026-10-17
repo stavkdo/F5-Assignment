@@ -1,8 +1,9 @@
 """Golden-file tests: real sample lines in, hand-checked redacted lines out.
 
 basic_input.ndjson holds the happy-path lines 2, 3, 5, 7, 9, 26, 27, 32, 40, 46, 47, 48 and 49
-of input.ndjson (Phase 2). sample_input.ndjson is the whole of input.ndjson except lines 11,
-15 and 16, whose JWTs still leak until the Phase 3f fix: a golden file must not bless a leak.
+of input.ndjson (Phase 2). sample_expected.ndjson is the output for the whole of input.ndjson.
+Until the Phase 3f fix it left out lines 11, 15 and 16, whose JWTs leaked: a golden file must
+not bless a leak.
 """
 
 from conftest import ROOT, run_stream
@@ -36,21 +37,21 @@ def test_basic_fixture_counts(redactor):
 
 
 def test_sample_fixture_matches_expected_output(redactor):
-    out, err, stats = run_stream(redactor, (FIXTURES / "sample_input.ndjson").read_bytes())
+    out, err, stats = run_stream(redactor, (ROOT / "input.ndjson").read_bytes())
     assert out == read_lines("sample_expected.ndjson")
-    assert (stats.read, stats.redacted, stats.blank) == (47, 40, 2)
+    assert (stats.read, stats.redacted, stats.blank) == (50, 43, 2)
     assert dict(stats.errors) == {"invalid JSON": 3, "not a JSON object": 2}
     assert err.splitlines() == [
-        "redactor: line 17: invalid JSON",
-        "redactor: line 18: invalid JSON",
-        "redactor: line 20: not a JSON object",
-        "redactor: line 21: not a JSON object",
-        "redactor: line 47: invalid JSON",
+        "redactor: line 20: invalid JSON",
+        "redactor: line 21: invalid JSON",
+        "redactor: line 23: not a JSON object",
+        "redactor: line 24: not a JSON object",
+        "redactor: line 50: invalid JSON",
     ]
 
 
 def test_sample_fixture_counts(redactor):
-    run_stream(redactor, (FIXTURES / "sample_input.ndjson").read_bytes())
+    run_stream(redactor, (ROOT / "input.ndjson").read_bytes())
     assert +redactor.counts == {
         "auth-headers": 9,
         "api-key-names": 7,
@@ -59,6 +60,7 @@ def test_sample_fixture_counts(redactor):
         "cvv-fields": 1,
         "pii-fields": 3,
         "email": 30,
+        "jwt": 4,  # line 11: 1, line 15: 2, line 16: 1
         "credit-card": 16,
         "api-key-prefix": 2,
     }
