@@ -1,4 +1,4 @@
-"""Line-by-line driver around the engine, shared by the CLI and (later) the HTTP service.
+"""Line-by-line driver around the engine, shared by the CLI and the HTTP service.
 
 Input is read as bytes, one line at a time, with a cap on the line length, so memory stays
 bounded by the longest allowed line no matter how big the input is.
@@ -16,6 +16,8 @@ DEFAULT_MAX_LINE_BYTES = 1024 * 1024  # 1 MiB
 # More fixed reasons, next to the engine's (see engine.py).
 LINE_TOO_LONG = "line too long"
 INTERNAL_ERROR = "internal error"
+
+BOM = "\N{BYTE ORDER MARK}"  # some Windows tools put it at the start of a UTF-8 file
 
 
 @dataclass
@@ -49,6 +51,62 @@ def error_record(lineno: int, reason: str) -> str:
     return json.dumps({"redactor_error": {"line": lineno, "reason": reason}}, separators=(",", ":"))
 
 
+class LineProcessor:
+    """Turns each input line of one stream into its output line, and counts what happened.
+
+    One per stream (a CLI run or one HTTP request), because it holds that stream's line number
+    and statistics. The CLI loop and the HTTP service both feed it lines; only where the lines
+    come from differs.
+    """
+
+    def __init__(self, redactor: Redactor, err: TextIO):
+        self.redactor = redactor
+        self.err = err
+        self.stats = StreamStats()
+
+    def process(self, raw: bytes | None) -> str | None:
+        """The output line, ending in a newline, for one input line; None for a blank line.
+
+        raw is None for a line that was longer than the limit (see read_lines).
+        """
+        stats = self.stats
+        stats.read += 1
+        lineno = stats.read
+        if raw is None:
+            return self._fail(lineno, LINE_TOO_LONG)
+        text = self._decode(raw, lineno)
+        if lineno == 1:
+            text = text.removeprefix(BOM)
+        if not text.strip():
+            stats.blank += 1  # NDJSON readers may skip blank lines; there is nothing in them to redact
+            return None
+        try:
+            redacted = self.redactor.redact_line(text)
+        except LineError as e:
+            return self._fail(lineno, str(e))
+        except Exception:
+            # A bug in the redactor must not stop the stream, and its traceback could hold line
+            # data, so it is reported with a fixed reason like any other bad line.
+            return self._fail(lineno, INTERNAL_ERROR)
+        stats.redacted += 1
+        return redacted + "\n"
+
+    def _decode(self, raw: bytes, lineno: int) -> str:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Not str(exception): its message quotes the offending bytes.
+            self.stats.invalid_utf8 += 1
+            self.err.write(f"redactor: line {lineno}: invalid UTF-8 replaced with U+FFFD\n")
+            return raw.decode("utf-8", errors="replace")
+
+    def _fail(self, lineno: int, reason: str) -> str:
+        # Line number and a fixed reason only, never the line content.
+        self.stats.errors[reason] += 1
+        self.err.write(f"redactor: line {lineno}: {reason}\n")
+        return error_record(lineno, reason) + "\n"
+
+
 def redact_stream(
     redactor: Redactor,
     source: BinaryIO,
@@ -57,47 +115,12 @@ def redact_stream(
     max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
 ) -> StreamStats:
     """Redact NDJSON from source to out. Only one line is held in memory at a time."""
-    stats = StreamStats()
-    for lineno, raw in enumerate(read_lines(source, max_line_bytes), start=1):
-        stats.read += 1
-        if raw is None:
-            _fail(out, err, stats, lineno, LINE_TOO_LONG)
-            continue
-        text = _decode(raw, lineno, err, stats)
-        if lineno == 1:
-            text = text.removeprefix("\ufeff")  # a UTF-8 byte order mark some Windows tools add
-        if not text.strip():
-            stats.blank += 1  # NDJSON readers may skip blank lines; there is nothing in them to redact
-            continue
-        try:
-            redacted = redactor.redact_line(text)
-        except LineError as e:
-            _fail(out, err, stats, lineno, str(e))
-        except Exception:
-            # A bug in the redactor must not stop the stream, and its traceback could hold line
-            # data, so it is reported with a fixed reason like any other bad line.
-            _fail(out, err, stats, lineno, INTERNAL_ERROR)
-        else:
-            out.write(redacted + "\n")
-            stats.redacted += 1
-    return stats
-
-
-def _decode(raw: bytes, lineno: int, err: TextIO, stats: StreamStats) -> str:
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        # Not str(exception): its message quotes the offending bytes.
-        stats.invalid_utf8 += 1
-        err.write(f"redactor: line {lineno}: invalid UTF-8 replaced with U+FFFD\n")
-        return raw.decode("utf-8", errors="replace")
-
-
-def _fail(out: TextIO, err: TextIO, stats: StreamStats, lineno: int, reason: str) -> None:
-    # Line number and a fixed reason only, never the line content.
-    stats.errors[reason] += 1
-    err.write(f"redactor: line {lineno}: {reason}\n")
-    out.write(error_record(lineno, reason) + "\n")
+    processor = LineProcessor(redactor, err)
+    for raw in read_lines(source, max_line_bytes):
+        line = processor.process(raw)
+        if line is not None:
+            out.write(line)
+    return processor.stats
 
 
 def format_summary(redactor: Redactor, stats: StreamStats) -> str:

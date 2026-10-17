@@ -1,0 +1,6 @@
+# Everything except what the Dockerfile copies stays out of the build context:
+# smaller and faster builds, and private files (notes, .git) never reach an image layer.
+*
+!pyproject.toml
+!redactor/
+redactor/__pycache__/

@@ -1,0 +1,17 @@
+# One stable name and address inside the cluster for all redactor pods.
+# Other pods call http://redactor/redact (port 80); Kubernetes forwards each connection to a
+# ready pod on port 8080. Pods come and go and change IPs; this name doesn't.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redactor
+  labels:
+    app: redactor
+spec:
+  type: ClusterIP # reachable only from inside the cluster: log traffic shouldn't be public
+  selector:
+    app: redactor # the pods from deploy/deployment.yaml
+  ports:
+    - name: http
+      port: 80
+      targetPort: http # the container port named "http" (8080)

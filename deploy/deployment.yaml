@@ -1,0 +1,69 @@
+# Runs the redactor service: 2 copies (pods) of the container, each with the rules mounted.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redactor
+  labels:
+    app: redactor
+spec:
+  # Two pods: if one crashes or its node goes down, the other keeps serving, and a rolling
+  # update can replace them one at a time with no downtime.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: redactor # which pods this Deployment owns (must match the template's labels)
+  template:
+    metadata:
+      labels:
+        app: redactor # the Service finds the pods by this label too
+    spec:
+      containers:
+        - name: redactor
+          image: redactor:0.1.0 # a fixed tag, never :latest, so every pod runs the same build
+          imagePullPolicy: IfNotPresent
+          args: ["--serve", "--addr", ":8080", "--rules", "/etc/redactor/rules.yaml"]
+          ports:
+            - name: http
+              containerPort: 8080
+          # Readiness: send traffic to this pod only while /healthz answers 200.
+          # The port opens only after the rules loaded, so "ready" means "can redact".
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          # Liveness: if /healthz stops answering for 3 checks in a row (30 s), restart the
+          # container. It answers from the event loop, so a stuck loop is noticed.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            # What the scheduler reserves for the pod. Idle, the process uses about 32 MiB.
+            requests:
+              cpu: 100m # a tenth of a core
+              memory: 64Mi
+            # A hard ceiling: above it the container is killed and restarted, instead of
+            # starving the other pods on the node. Each request holds at most one 1 MiB line
+            # (and its parsed tree) at a time: 8 requests of 1 MiB lines at once peaked at
+            # 153 MiB, so this leaves room for about 14.
+            # No CPU limit: CPU over the request is only throttled, never fatal, and one
+            # Python process uses at most about one core anyway.
+            limits:
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true # refuse to start if the image would run as root
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true # the service never writes to disk
+            capabilities:
+              drop: ["ALL"] # no special kernel permissions
+          volumeMounts:
+            - name: rules
+              mountPath: /etc/redactor
+              readOnly: true
+      volumes:
+        - name: rules
+          configMap:
+            name: redactor-rules # deploy/configmap.yaml; its rules.yaml key becomes a file

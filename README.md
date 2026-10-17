@@ -1,6 +1,6 @@
 # API Traffic Log Redactor
 
-A command-line tool that reads API traffic logs as NDJSON (one HTTP transaction per line),
+A command-line tool (and HTTP service) that reads API traffic logs as NDJSON (one HTTP transaction per line),
 redacts sensitive data (credentials, tokens, emails, card numbers, personal data) according to
 rules in a YAML file, and writes the same NDJSON with the secrets replaced. It streams, so the
 input can be far larger than memory, and it never crashes on a bad line.
@@ -29,9 +29,12 @@ Dependencies, kept to the minimum:
 | Dependency | Why |
 |---|---|
 | PyYAML | The rules are YAML, and Python's standard library has no YAML parser. Loaded with `safe_load`, which can't build arbitrary objects. |
-| pytest (dev only) | Test runner. Parametrised tests keep the edge-case tables short. |
+| FastAPI + uvicorn | Service mode only. uvicorn is the HTTP server; FastAPI (built on Starlette) handles routing and the streamed response. The CLI never imports them. |
+| pytest, httpx (dev only) | Test runner, and the HTTP client FastAPI's `TestClient` needs. |
 
-Everything else (JSON, regex, hashing, URL decoding) is the standard library.
+Everything else (JSON, regex, hashing, URL decoding) is the standard library. The runtime
+dependencies are pinned to exact versions in `pyproject.toml`: this is an application, and the
+Docker image should be built from the code the tests ran against.
 
 ## Build, run and test
 
@@ -42,7 +45,7 @@ Python 3.11 or newer.
 ```sh
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"            # installs PyYAML, pytest and the `redactor` command
+pip install -e ".[dev]"            # installs the dependencies, pytest and the `redactor` command
 ```
 
 ### CLI
@@ -76,7 +79,34 @@ use `cmd /c "python -m redactor input.ndjson > out.ndjson 2> err.txt"` to get cl
 
 ### Service mode
 
-<!-- Phase 5: how to start it, how to call POST /redact, and what the health endpoint returns. -->
+```sh
+redactor --serve [--addr :8080] [--rules rules.yaml] [--max-line-bytes N]
+
+redactor --serve --addr :8080 --rules rules.yaml
+curl -s -X POST --data-binary @input.ndjson http://localhost:8080/redact > redacted.ndjson
+curl -s -T - -H "Transfer-Encoding: chunked" http://localhost:8080/redact < input.ndjson   # streamed upload
+curl -s http://localhost:8080/healthz     # {"status":"ok"}
+```
+
+| Endpoint | |
+|---|---|
+| `POST /redact` | Body: NDJSON. Response: `200`, `application/x-ndjson`, the redacted lines, exactly what the CLI writes for the same input (bad lines become the same error records). Streamed both ways. |
+| `GET /healthz` | `200 {"status":"ok"}` while the service can redact. See [Health endpoint](#health-endpoint). |
+
+- `--addr` is `[host]:port`; an empty host means all interfaces.
+- If the rules can't be loaded, the process exits with code `2` **before opening the port**,
+  so there is never a moment when it accepts traffic without rules.
+- stderr gets uvicorn's access log, plus the same per-line problems and summary as the CLI,
+  once per request.
+- Problems inside the body don't change the status: it is already `200` by the time line 2 is
+  read (that's what streaming means). They show up as error records in the output, in order.
+
+With Docker (the rules are mounted, not built in, see [Dockerfile](#dockerfile)):
+
+```sh
+docker build -t redactor:0.1.0 .
+docker run -p 8080:8080 -v "$PWD/rules.yaml:/etc/redactor/rules.yaml:ro" redactor:0.1.0
+```
 
 ### Tests
 
@@ -99,6 +129,8 @@ python -m pytest -rx        # also list the known gaps (expected failures) and w
 | `test_streaming.py` | Memory stays flat as the input grows; a huge line is never held in memory |
 | `test_fixtures.py` | Golden files: real sample lines in, hand-checked output out |
 | `test_cli.py` | The real command: files, stdin, flags, exit codes |
+| `test_service.py` | Cutting a chunked body into lines (any chunking gives the CLI's lines), the endpoints, output equal to the CLI's, a real server streaming both ways, refusing to start on bad rules |
+| `test_deploy.py` | The deployment files agree: the ConfigMap equals `rules.yaml`, the mount path is where `--rules` points, probes, ports, labels, image tag, non-root |
 | `test_known_gaps.py` | Known gaps written as strict expected failures (see [Known limitations](#known-limitations)) |
 
 ## Project layout
@@ -111,13 +143,21 @@ redactor/
   jsonio.py           JSON read/write that keeps numbers, repeated keys and odd characters intact
   engine.py           Redactor: one line in, one redacted line out. Knows nothing about files
   stream.py           line-by-line driver: line size limit, error records, summary
-  cli.py              argument parsing, exit codes
+  service.py          HTTP service: POST /redact (streamed), GET /healthz
+  cli.py              argument parsing, exit codes, starts the service with --serve
 tests/                pytest suite and golden fixtures
+Dockerfile            the service image
+.dockerignore         keeps everything but the code out of the image
+deploy/
+  configmap.yaml      rules.yaml as a ConfigMap (generated copy, checked by a test)
+  deployment.yaml     2 pods of the image, rules mounted, probes, limits, locked down
+  service.yaml        one stable in-cluster name and address for the pods
 ```
 
-The layers only depend downwards (cli → stream → engine → rules/actions/jsonio). The engine
-works on one string at a time and the stream works on any binary file-like object, so the HTTP
-service can reuse both without changes.
+The layers only depend downwards (cli → service/stream → engine → rules/actions/jsonio). The
+engine works on one string at a time. `stream.LineProcessor` turns one input line into one
+output line (error records, blank lines, UTF-8 repair, statistics), and both the CLI loop and
+the service feed it; only where the lines come from differs.
 
 ## Design decisions and trade-offs
 
@@ -357,6 +397,15 @@ stderr:  redactor: line 20: invalid JSON
 includes the offending bytes). There's no traceback either: an unexpected exception in one line
 becomes an `internal error` record and the stream goes on.
 
+**Rules are all or nothing, checked before anything runs.** The brief says that if the rules
+can't be loaded, the service must not pass traffic through unredacted. So the rules are loaded
+and validated before the CLI reads a line or the service opens its port, and any problem exits
+with code `2`. "Can't be loaded" covers more than a missing or broken file. A file that parses
+but has **no rules** (`version: 1` alone, an empty ConfigMap), or a **misspelled section**
+(`key_rule:`, silently ignored before), would start a redactor that redacts nothing, which is
+the same leak. Both are refused too. A bad regex, action, scope or validator in any rule
+rejects the whole file: running with "the rules that did load" would quietly drop protection.
+
 Other choices:
 
 - A failed line's rule counts are **discarded**, so the summary only counts what was written.
@@ -364,6 +413,44 @@ Other choices:
 - **Invalid UTF-8** bytes are replaced with U+FFFD and the line is still redacted. Replacing
   only removes information, and stderr says which line.
 - `NaN`/`Infinity` are rejected as invalid JSON. Python accepts them, but other parsers don't.
+
+### Service mode: streaming both ways
+
+`POST /redact` never holds the whole body. uvicorn hands the body over in chunks as they
+arrive. `split_lines` cuts them into lines with the same rules as the CLI (the same 1 MiB limit,
+a too-long line dropped as it arrives), and each line is redacted and sent back right away. A
+test sends one line, waits for its redacted copy, and only then sends the next, over a raw
+socket against a real server. Memory per request is one line plus one chunk. If the client
+reads slowly, sending blocks, so we stop reading its body: TCP flow control does the rest, and
+nothing piles up.
+
+- **Same output as the CLI.** Both feed the same `LineProcessor`, so error records, blank lines
+  and UTF-8 repair are identical. Tests compare the service's output with the CLI's on the whole
+  sample file, and on 20 random ways of cutting the same body into chunks.
+- **The redaction runs in a worker thread** (`asyncio.to_thread`), one batch (the lines of one
+  chunk) at a time. FastAPI runs every request on one event loop. Redacting is CPU work, and
+  done on the loop it would freeze every other request and `/healthz` until it finished.
+  Measured with 4 clients each sending 1 MB lines: `/healthz` took up to **2.5 s** with the
+  redaction on the loop and under **0.15 s** in a thread. The GIL still runs one thread's Python
+  at a time, so threads add responsiveness, not speed; more speed comes from more pods.
+- **Order is kept**: each batch is awaited before the next is read.
+- **One `Redactor` per request.** It holds the counts of the line it is working on, so sharing
+  one between concurrent requests would mix them up. The compiled rules are shared: nothing
+  changes them after loading.
+- **Errors can't change the status code.** By the time line 2 is read, `200` and line 1 have
+  already been sent. Bad lines become error records in the output, like in the CLI.
+- **Shutdown:** on SIGTERM (Kubernetes stopping a pod), uvicorn stops accepting connections and
+  lets running requests finish for up to 20 s, inside Kubernetes' 30 s grace period.
+
+**A bug found on the way.** Starlette's `StreamingResponse` (0.41, used by FastAPI 0.115) runs a
+"has the client disconnected?" listener next to the response. It reads from the same channel as
+the request body and throws away everything that isn't a disconnect. When the body is still
+arriving while the response streams, which is exactly this endpoint, the listener swallowed
+the body chunks. A client uploading in pieces got back an **empty** response: no leak, but
+silently lost lines. A whole body sent at once worked, so a simple test wouldn't have shown it.
+`BodyStreamingResponse` in `service.py` sends without that listener, so only our code reads the
+body. A disconnect is still noticed, because reading the body raises `ClientDisconnect`. The
+streaming test fails (times out) with Starlette's original class.
 
 ### Idempotency
 
@@ -447,17 +534,91 @@ Phase 3f, not done yet. Tell it as a short debugging story:
 
 ## Deployment
 
+Four small files: a `Dockerfile` and three manifests in `deploy/`. I kept them to what the
+service needs and what I can explain. Every choice is also commented in the files themselves.
+
+```sh
+docker build -t redactor:0.1.0 .
+kind create cluster --name redactor              # a throwaway local cluster (needs Docker)
+kind load docker-image redactor:0.1.0 --name redactor
+kubectl apply -f deploy/
+kubectl rollout status deployment/redactor
+kubectl port-forward service/redactor 8080:80    # then curl localhost:8080 as above
+```
+
+I ran exactly this on kind (v0.33). The output through the Service, from a pod inside the
+cluster, was byte-for-byte the CLI's output on the sample file.
+
 ### Dockerfile
 
-<!-- Phase 6: base image, non-root user, pinned versions, where the rules file comes from. Why each choice. -->
+| Choice | Why |
+|---|---|
+| `python:3.12.7-slim-bookworm` | Official image, slim (no compilers or docs), the exact version the tests ran on, so every build starts the same. |
+| Copy only `pyproject.toml` and `redactor/` (+ `.dockerignore` that excludes everything else) | No tests, `.git` or personal notes in any image layer. Smaller context, faster builds. |
+| `pip install --no-cache-dir .` with pinned dependencies | Same versions as the tests. No pip cache left in the image. |
+| `USER 10001` (no root) | If the process were ever taken over, it has no privileges in the container. |
+| Rules **not** copied in | They come from a ConfigMap at `/etc/redactor/rules.yaml`. Without them the container exits with code `2` instead of starting. |
+| `ENTRYPOINT ["redactor"]`, `CMD [--serve ...]` | Exec form: the process is PID 1 and receives SIGTERM directly, so graceful shutdown works. The CMD can be overridden to use the CLI. |
+| `PYTHONUNBUFFERED`, `PYTHONDONTWRITEBYTECODE` | Logs appear immediately in `kubectl logs`; no `.pyc` writes on a read-only filesystem. |
+
+Single stage, on purpose: there is nothing to compile, so a multi-stage build would save
+little. The image is 214 MB, nearly all of it the Python base image.
 
 ### Kubernetes
 
-<!-- Phase 6: Deployment, Service, ConfigMap, probes, resource requests/limits. Why each one. -->
+**`configmap.yaml`: the rules.** Rules are config, not code, so changing them needs no new
+image. The file is generated from `rules.yaml` by `kubectl create configmap ... --dry-run`
+(the command is in its header), and `tests/test_deploy.py` fails if the two differ. The service
+reads the rules once at startup, so after changing them: `kubectl rollout restart
+deployment/redactor` (hot reload is a bonus I didn't do).
+
+**`deployment.yaml`: runs the pods.**
+
+| Choice | Why |
+|---|---|
+| `replicas: 2` | One pod can crash or be replaced while the other serves. A rolling update replaces them one at a time. |
+| Image tag `0.1.0`, never `latest` | Every pod runs the same known build; `test_deploy.py` checks it matches `pyproject.toml`. |
+| Readiness and liveness probes on `/healthz` | See [Health endpoint](#health-endpoint). |
+| Requests `100m` CPU, `64Mi` memory | What the scheduler reserves. Idle, the process uses 32 MiB. |
+| Limit `256Mi` memory | A hard ceiling, so a runaway pod is restarted instead of starving its node. Measured: 8 clients sending 1 MB lines at once peaked at 153 MiB (~15 MiB per line in flight). |
+| No CPU limit | Going over the CPU request only slows a pod down (throttling); it's never fatal. One Python process uses at most about one core anyway (GIL). |
+| `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drop all capabilities | The service only reads its rules and talks HTTP. Anything else it could do is attack surface. Tested: it runs fine read-only. |
+| Rules mounted read-only at `/etc/redactor` | The path `--rules` points to (checked by a test). |
+
+**`service.yaml`: one stable address.** Pods come and go and change IPs. The Service gives them
+one name, `http://redactor/redact` on port 80 inside the cluster, and forwards each connection
+to a ready pod's port 8080. `ClusterIP` (the default) keeps it reachable from inside the cluster
+only: raw logs with secrets in them shouldn't cross the public internet.
+
+**Fail closed, tested on kind.** I deployed three kinds of bad rules on purpose:
+
+| What I broke | What happened |
+|---|---|
+| Invalid YAML in the ConfigMap | New pod: `CrashLoopBackOff`, never ready |
+| A ConfigMap with no rules (`version: 1`) | New pod: "refusing to run without redaction", `CrashLoopBackOff` |
+| ConfigMap deleted | New pod can't mount its volume (`FailedMount`), never starts |
+
+In all three, the rolling update stopped and the old pods kept serving with the good rules
+they had loaded, so a request through the Service was still redacted. On a fresh install
+with bad rules there are no ready pods at all: callers get connection errors, never
+unredacted data.
 
 ### Health endpoint
 
-<!-- Phase 5: path and meaning (liveness vs readiness). What "healthy" means for this service. -->
+`GET /healthz` returns `200 {"status":"ok"}`. Kubernetes uses it for both probes, and that's
+enough here because of how startup works:
+
+- **Readiness** ("send me traffic?"): the port only opens after the rules have loaded and been
+  validated. So if `/healthz` answers at all, this pod can redact. A pod with bad rules never
+  answers and never gets traffic.
+- **Liveness** ("restart me?"): `/healthz` is answered by the event loop. If the loop got stuck,
+  the probe would fail 3 times (30 s) and Kubernetes would restart the container. Because the
+  redaction runs in threads, a busy pod still answers in milliseconds, so busy isn't mistaken
+  for stuck.
+
+A deeper check (redact a test line on every probe) would only test code that already ran at
+startup, and would cost CPU on every probe. Separate `/readyz` and `/livez` endpoints would make
+sense with hot reload, where the rules could change while the pod is running.
 
 ## Known limitations
 
@@ -488,6 +649,17 @@ fixed, its test fails until the marker is removed, so this list can't silently g
   a card (see [Numbers](#numbers)).
 - **Embedded JSON that gets rewritten** loses its original spacing (only when something in it was redacted).
 
+Service and deployment:
+
+- **No limit on concurrent requests per pod.** Each request in flight with a 1 MB line costs
+  about 15 MiB, so roughly 14 at once fit in the 256 MiB limit. More, and the pod is killed
+  (OOM) and restarted; its in-flight requests fail, but nothing leaks.
+- **No TLS or authentication** on the endpoint. It is reachable only inside the cluster
+  (`ClusterIP`), but any pod in the cluster can call it.
+- **Changing rules needs a restart** of the pods (`kubectl rollout restart`).
+- The ConfigMap is a **generated copy** of `rules.yaml`. A test catches drift, but someone has to
+  regenerate it.
+
 ## What I'd do with more time
 
 - HMAC-SHA256 instead of plain SHA-256 (see [Hashing](#hashing-is-sha-256-safe)).
@@ -506,6 +678,15 @@ fixed, its test fails until the marker is removed, so this list can't silently g
   could be handed to the C `json.dumps`, and only the parts that have them would go through the
   Python writer. That keeps the output identical and wins back most of the ~17% (see
   [Why `jsonio.py` exists](#why-jsoniopy-exists)).
+- **Bound the memory per pod**: a cap on requests in flight (a semaphore around the redaction,
+  `503` beyond it) so the memory limit can never be reached, plus a HorizontalPodAutoscaler to
+  add pods under load instead.
+- **Hot-reload of the rules** (a brief bonus): watch the mounted file, load and validate the new
+  rules, and swap them in only if they're valid. Bad new rules would keep the old ones running,
+  never none. Readiness and liveness would then get separate endpoints.
+- **Prometheus metrics** (a brief bonus): the per-rule counts and error reasons already exist in
+  the summary; exposing them on `/metrics` is mostly wiring.
+- **mTLS or a NetworkPolicy** so only the services that should send logs can reach the redactor.
 
 ## Running inline with a sub-millisecond budget
 

@@ -1,4 +1,8 @@
-"""Command line entry point: redactor [--rules rules.yaml] [--max-line-bytes N] [input-file]"""
+"""Command line entry point.
+
+    redactor [--rules rules.yaml] [--max-line-bytes N] [input-file]
+    redactor --serve [--addr :8080] [--rules rules.yaml] [--max-line-bytes N]
+"""
 
 import argparse
 import os
@@ -17,13 +21,30 @@ def main(argv: list[str] | None = None) -> int:
         help=f"longer lines are replaced by an error record (default: {DEFAULT_MAX_LINE_BYTES})",
     )
     parser.add_argument("input", nargs="?", help="NDJSON input file (default: stdin)")
+    parser.add_argument("--serve", action="store_true", help="run as an HTTP service instead (POST /redact)")
+    parser.add_argument("--addr", default=":8080", help="service address, [host]:port (default: :8080)")
     args = parser.parse_args(argv)
+    if args.serve and args.input:
+        parser.error("an input file can't be used with --serve")
 
+    # Rules are loaded before anything else, also before the service opens its port: if they
+    # can't be loaded, the service never starts, so it can't pass traffic through unredacted.
     try:
         rules = load_rules(args.rules)
     except RulesError as e:
         print(f"redactor: {e}", file=sys.stderr)
         return 2
+
+    if args.serve:
+        from redactor.service import parse_addr, serve  # the CLI alone doesn't need the web stack
+
+        try:
+            parse_addr(args.addr)
+        except ValueError as e:
+            print(f"redactor: {e}", file=sys.stderr)
+            return 2
+        serve(rules, args.addr, args.max_line_bytes)
+        return 0
 
     # Always UTF-8 with "\n" line endings, whatever the platform default is (e.g. cp1252 on Windows).
     sys.stdout.reconfigure(encoding="utf-8", newline="\n")

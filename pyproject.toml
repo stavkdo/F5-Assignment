@@ -7,10 +7,16 @@ name = "redactor"
 version = "0.1.0"
 description = "Redact sensitive data from NDJSON API traffic logs"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6.0"]
+# An application, not a library: pinned to the exact versions the tests ran with, so the
+# Docker image is built from the same code every time.
+dependencies = [
+    "PyYAML==6.0.2",
+    "fastapi==0.115.5",  # brings starlette 0.41 (see BodyStreamingResponse in service.py)
+    "uvicorn==0.32.1",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "httpx>=0.27"]  # httpx: FastAPI's TestClient
 
 [project.scripts]
 redactor = "redactor.cli:main"

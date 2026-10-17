@@ -61,6 +61,12 @@ def test_scope_none_matches_any_scope():
     (lambda d: d["value_rules"][0].pop("pattern"), "missing 'pattern'"),
     (lambda d: d["key_rules"][1].update(name="auth"), "duplicate rule names"),
     (lambda d: d["settings"]["hash"].update(algorithm="md5"), "unsupported hash"),
+    # Configs that parse but would redact less than intended: refused, never run with.
+    (lambda d: d.update(key_rule=d.pop("key_rules")), "unknown top-level keys"),
+    (lambda d: d.update(key_rules=[], value_rules=[]), "no rules"),
+    (lambda d: (d.pop("key_rules"), d.pop("value_rules")), "no rules"),
+    (lambda d: d.update(key_rules={"name": "auth"}), "must be a list"),
+    (lambda d: d.update(value_rules=["card"]), "must be a list"),
 ])
 def test_invalid_config_is_rejected(change, message):
     with pytest.raises(RulesError, match=message):

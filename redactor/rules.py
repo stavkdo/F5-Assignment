@@ -74,19 +74,38 @@ def load_rules(path: str) -> Rules:
     return parse_rules(data)
 
 
+TOP_LEVEL = {"version", "settings", "key_rules", "value_rules"}
+
+
 def parse_rules(data) -> Rules:
     if not isinstance(data, dict):
         raise RulesError("rules file must be a YAML mapping")
+    # A misspelled section ("key_rule:") would otherwise be ignored, and the tool would start
+    # with fewer rules than intended: data it should redact would pass through.
+    unknown = set(data) - TOP_LEVEL
+    if unknown:
+        raise RulesError(f"unknown top-level keys: {sorted(map(str, unknown))} (expected {sorted(TOP_LEVEL)})")
 
     rules = Rules(
         settings=_parse_settings(data.get("settings") or {}),
-        key_rules=[_parse_key_rule(r) for r in data.get("key_rules") or []],
-        value_rules=[_parse_value_rule(r) for r in data.get("value_rules") or []],
+        key_rules=[_parse_key_rule(r) for r in _rule_list(data, "key_rules")],
+        value_rules=[_parse_value_rule(r) for r in _rule_list(data, "value_rules")],
     )
     names = rules.names()
+    if not names:
+        # A file that parses but has no rules (an empty ConfigMap, the wrong file) would redact
+        # nothing: the same as passing traffic through unredacted. Refuse it like a broken file.
+        raise RulesError("the rules file has no rules: refusing to run without redaction")
     duplicates = {n for n in names if names.count(n) > 1}
     if duplicates:
         raise RulesError(f"duplicate rule names: {sorted(duplicates)}")
+    return rules
+
+
+def _rule_list(data: dict, section: str) -> list[dict]:
+    rules = data.get(section) or []
+    if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+        raise RulesError(f"{section} must be a list of rules (mappings)")
     return rules
 
 
