@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# OS / downloads
+.DS_Store
+download
+
+# Personal notes
+ANS.md
