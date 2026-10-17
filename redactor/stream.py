@@ -7,7 +7,7 @@ bounded by the longest allowed line no matter how big the input is.
 import json
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import BinaryIO, Iterator, TextIO
+from typing import BinaryIO, Callable, Iterator, TextIO
 
 from redactor.engine import LineError, Redactor
 
@@ -113,13 +113,22 @@ def redact_stream(
     out: TextIO,
     err: TextIO,
     max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
+    before_line: Callable[[], None] | None = None,
 ) -> StreamStats:
-    """Redact NDJSON from source to out. Only one line is held in memory at a time."""
+    """Redact NDJSON from source to out. Only one line is held in memory at a time.
+
+    before_line runs before each line (the rules watcher). It also means the stream is live,
+    so each line is flushed: whoever reads a `tail -f` shouldn't wait for a full buffer.
+    """
     processor = LineProcessor(redactor, err)
     for raw in read_lines(source, max_line_bytes):
+        if before_line is not None:
+            before_line()
         line = processor.process(raw)
         if line is not None:
             out.write(line)
+            if before_line is not None:
+                out.flush()
     return processor.stats
 
 
@@ -134,6 +143,8 @@ def format_summary(redactor: Redactor, stats: StreamStats) -> str:
     if stats.invalid_utf8:
         lines.append(f"  lines with invalid UTF-8 repaired: {stats.invalid_utf8}")
     names = redactor.rules.names()
+    # A rule removed by a reload (--watch-rules) still did its redactions, so it's still listed.
+    names += [name for name in redactor.counts if name not in names]
     width = max(len(n) for n in names) if names else 0
     lines.append("  redactions per rule:")
     lines += [f"    {name:<{width}}  {redactor.counts[name]}" for name in names]

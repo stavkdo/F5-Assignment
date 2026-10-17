@@ -4,9 +4,11 @@ Every problem in the config (unknown action, bad regex, unknown validator, ...) 
 RulesError at load time, so the tool never starts with rules it doesn't understand.
 """
 
+import dataclasses
+import os
 import re
-from dataclasses import dataclass
-from typing import Callable
+from dataclasses import dataclass, field
+from typing import Callable, Mapping
 
 import yaml
 
@@ -14,6 +16,11 @@ from redactor.actions import VALIDATORS
 
 ACTIONS = {"mask", "partial", "hash", "remove"}
 SCOPES = {"headers", "body", "any"}
+
+# --hmac reads its key from the environment, never from rules.yaml (which is in git and in a
+# ConfigMap anyone in the namespace can read) or from the command line (shell history, ps).
+HMAC_KEY_ENV = "REDACTOR_HMAC_KEY"
+MIN_HMAC_KEY_BYTES = 32  # as long as the SHA-256 output (RFC 2104 advises at least that)
 
 
 class RulesError(Exception):
@@ -25,6 +32,8 @@ class Settings:
     mask: str = "****"
     keep_last: int = 4
     fill: str = "*"
+    # Set by --hmac. repr=False so the key can't end up in a log or a traceback.
+    hmac_key: bytes | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -64,14 +73,43 @@ class Rules:
 
 
 def load_rules(path: str) -> Rules:
+    return read_rules_file(path)[0]
+
+
+def read_rules_file(path: str) -> tuple[Rules, bytes]:
+    """The rules, and the exact bytes they came from (the watcher compares later reads to them)."""
     try:
-        with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        with open(path, "rb") as f:
+            content = f.read()
     except OSError as e:
         raise RulesError(f"cannot read rules file {path}: {e.strerror}") from e
+    return parse_rules_file(content, path), content
+
+
+def parse_rules_file(content: bytes, path: str) -> Rules:
+    """Rules from the bytes of a rules file. Used at startup and by the rules watcher."""
+    try:
+        data = yaml.safe_load(content.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        raise RulesError(f"rules file {path} is not UTF-8") from e
     except yaml.YAMLError as e:
         raise RulesError(f"invalid YAML in {path}: {e}") from e
     return parse_rules(data)
+
+
+def hmac_key_from_env(environ: Mapping[str, str] = os.environ) -> bytes:
+    """The --hmac key. Missing or short means refuse to run, never fall back to plain SHA-256."""
+    key = environ.get(HMAC_KEY_ENV, "").encode("utf-8")
+    if len(key) < MIN_HMAC_KEY_BYTES:
+        # The message says what's wrong, never what the key is.
+        state = "is not set" if not key else "is too short"
+        raise RulesError(f"--hmac needs a secret key of at least {MIN_HMAC_KEY_BYTES} bytes in {HMAC_KEY_ENV}, and it {state}")
+    return key
+
+
+def with_hmac_key(rules: Rules, key: bytes) -> Rules:
+    """The same rules, with the hash action switched to HMAC-SHA256 under this key."""
+    return dataclasses.replace(rules, settings=dataclasses.replace(rules.settings, hmac_key=key))
 
 
 TOP_LEVEL = {"version", "settings", "key_rules", "value_rules"}

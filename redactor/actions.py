@@ -1,10 +1,12 @@
 """The redaction actions and validators, as small pure functions."""
 
 import hashlib
+import hmac
 import re
 
 HASH_PREFIX = "sha256:"
-_HASH_TOKEN = re.compile(r"sha256:[0-9a-f]{64}")
+HMAC_PREFIX = "hmac-sha256:"
+_HASH_TOKEN = re.compile(r"(?:sha256|hmac-sha256):[0-9a-f]{64}")
 
 
 def mask(value: str, replacement: str = "****") -> str:
@@ -24,8 +26,15 @@ def sha256(value: str) -> str:
     return HASH_PREFIX + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def hmac_sha256(value: str, key: bytes) -> str:
+    # Plain SHA-256 of a card or an email can be guessed forwards: hash every candidate and
+    # compare. HMAC mixes a secret key into the hash, so without the key nobody can test a guess.
+    # Equal values still give equal outputs, so "same user" can still be seen across lines.
+    return HMAC_PREFIX + hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def is_hash(text: str) -> bool:
-    """True if text is exactly what sha256() produces."""
+    """True if text is exactly what sha256() or hmac_sha256() produces."""
     return _HASH_TOKEN.fullmatch(text) is not None
 
 

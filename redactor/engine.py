@@ -273,5 +273,7 @@ class Redactor:
         if action == "partial":
             return actions.partial(value, settings.keep_last, settings.fill)
         if action == "hash":
+            if settings.hmac_key is not None:
+                return actions.hmac_sha256(value, settings.hmac_key)
             return actions.sha256(value)
         return actions.remove(value)

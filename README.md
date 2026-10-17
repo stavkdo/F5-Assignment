@@ -5,40 +5,26 @@ redacts sensitive data (credentials, tokens, emails, card numbers, personal data
 rules in a YAML file, and writes the same NDJSON with the secrets replaced. It streams, so the
 input can be far larger than memory, and it never crashes on a bad line.
 
+The whole development process, phase by phase with the questions and decisions along the way,
+is in [`docs/development-process.html`](docs/development-process.html). GitHub shows HTML as
+source, so download it and open it in a browser.
+
 ## Why Python
 
 I wrote this in Python because it's the language I know best, and so I could explain the code.
 I don't know Go but I'm willing to learn.
 
-
-Where Python costs me:
-
-- **Speed.** Every line is parsed into Python objects and walked by an interpreter. The regex
-  engine itself is C, but the glue around it isn't. See [Streaming](#streaming) for measured numbers.
-- **Startup.** About 0.2 s of interpreter start-up per CLI run. Fine for a batch tool, and a
-  service pays it only once.
-- **Parallelism.** The GIL means one Python process uses one core for this CPU-bound work. A
-  worker pool would need processes instead of threads.
-
-A Go port would keep the same structure (rules → engine → stream → CLI). One thing would change:
-Go's `regexp` (RE2) has no back-references, so the card pattern's "same separator throughout"
-check (`\1`) would move from the regex into the validator.
-
-Dependencies, kept to the minimum:
-
 | Dependency | Why |
 |---|---|
-| PyYAML | The rules are YAML, and Python's standard library has no YAML parser. Loaded with `safe_load`, which can't build arbitrary objects. |
-| FastAPI + uvicorn | Service mode only. uvicorn is the HTTP server; FastAPI (built on Starlette) handles routing and the streamed response. The CLI never imports them. |
+| PyYAML | The rules are YAML, and the standard library has no YAML parser. Loaded with `safe_load`, which can't build arbitrary objects. |
+| FastAPI + uvicorn | Service mode only: uvicorn is the HTTP server, FastAPI does routing and the streamed response. The CLI never imports them. |
 | pytest, httpx (dev only) | Test runner, and the HTTP client FastAPI's `TestClient` needs. |
 
-Everything else (JSON, regex, hashing, URL decoding) is the standard library. The runtime
-dependencies are pinned to exact versions in `pyproject.toml`: this is an application, and the
-Docker image should be built from the code the tests ran against.
+Everything else (JSON, regex, hashing, URL decoding) is the standard library. Runtime
+dependencies are pinned exactly in `pyproject.toml`, so the Docker image is built from the
+versions the tests ran against.
 
 ## Build, run and test
-
-### Requirements
 
 Python 3.11 or newer.
 
@@ -59,49 +45,50 @@ python -m redactor input.ndjson    # same thing without installing
 ```
 
 - **stdout:** the redacted NDJSON, one line per input line (blank lines are skipped).
-- **stderr:** one line per problem (`redactor: line 20: invalid JSON`), then a summary at the end:
+- **stderr:** one line per problem (`redactor: line 20: invalid JSON`), then a summary:
 
 ```text
 redactor: 50 lines read: 43 redacted, 5 replaced by an error record, 2 blank skipped
   errors: invalid JSON 3, not a JSON object 2
   redactions per rule:
     auth-headers        9
-    api-key-names       7
-    secret-fields       13
     ...
 ```
 
-- **Exit codes:** `0` done (even if some lines were bad: they are reported, not fatal),
-  `2` the rules or the input file can't be read, `1` an I/O error while streaming, `130` Ctrl-C.
+- **Exit codes:** `0` done (bad lines are reported, not fatal), `2` the rules or the input file
+  can't be read, `1` an I/O error while streaming, `130` Ctrl-C.
 
-On Windows PowerShell 5.1, redirecting a native program's output with `>` re-encodes it, so
-use `cmd /c "python -m redactor input.ndjson > out.ndjson 2> err.txt"` to get clean UTF-8 files.
+### Bonus flags: HMAC hashing and live rule reload
+
+```sh
+# HMAC: hash with a secret key instead of plain SHA-256 (see "Hashing" below)
+export REDACTOR_HMAC_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+redactor --hmac input.ndjson          # PowerShell: $env:REDACTOR_HMAC_KEY = "..."
+
+# Hot reload: edit rules.yaml while a long stream runs; new lines use the new rules
+tail -f app.log | redactor --watch-rules > redacted.log
+```
+
+Without `--hmac` the tool hashes with plain SHA-256, as the brief defines. With `--hmac` but no
+key (or one shorter than 32 bytes), it refuses to start (exit code `2`): it never quietly falls
+back to the weaker hash.
 
 ### Service mode
 
 ```sh
-redactor --serve [--addr :8080] [--rules rules.yaml] [--max-line-bytes N]
-
 redactor --serve --addr :8080 --rules rules.yaml
 curl -s -X POST --data-binary @input.ndjson http://localhost:8080/redact > redacted.ndjson
 curl -s -T - -H "Transfer-Encoding: chunked" http://localhost:8080/redact < input.ndjson   # streamed upload
 curl -s http://localhost:8080/healthz     # {"status":"ok"}
 ```
 
-| Endpoint | |
-|---|---|
-| `POST /redact` | Body: NDJSON. Response: `200`, `application/x-ndjson`, the redacted lines, exactly what the CLI writes for the same input (bad lines become the same error records). Streamed both ways. |
-| `GET /healthz` | `200 {"status":"ok"}` while the service can redact. See [Health endpoint](#health-endpoint). |
+- `POST /redact`: NDJSON in, exactly the lines the CLI would write out (`200`,
+  `application/x-ndjson`), streamed in both directions.
+- `GET /healthz`: `200 {"status":"ok"}` (see [Health endpoint](#health-endpoint)).
+- If the rules can't be loaded, the process exits with code `2` **before opening the port**, so
+  it never accepts traffic it can't redact.
 
-- `--addr` is `[host]:port`; an empty host means all interfaces.
-- If the rules can't be loaded, the process exits with code `2` **before opening the port**,
-  so there is never a moment when it accepts traffic without rules.
-- stderr gets uvicorn's access log, plus the same per-line problems and summary as the CLI,
-  once per request.
-- Problems inside the body don't change the status: it is already `200` by the time line 2 is
-  read (that's what streaming means). They show up as error records in the output, in order.
-
-With Docker (the rules are mounted, not built in, see [Dockerfile](#dockerfile)):
+With Docker (the rules are mounted, not built in):
 
 ```sh
 docker build -t redactor:0.1.0 .
@@ -115,23 +102,14 @@ python -m pytest            # all tests
 python -m pytest -rx        # also list the known gaps (expected failures) and why
 ```
 
-| File | What it covers |
+| Area | Files |
 |---|---|
-| `test_rules.py` | Loading the YAML; every kind of invalid config is rejected at startup |
-| `test_actions.py` | mask, partial, hash, remove, the Luhn check |
-| `test_engine.py` | Value rules in a string, the recursive walker, key rules, whole records |
-| `test_jsonio.py` | Numbers, repeated keys, NaN, unicode and lone surrogates survive a round trip |
-| `test_failures.py` | Bad lines become error records; nothing from the line reaches stdout/stderr; deep nesting; invalid UTF-8 |
-| `test_key_matching.py` | Case, arrays, `null`/numbers/objects under a sensitive key, near-miss names, repeated keys |
-| `test_body_shapes.py` | JSON inside strings, form bodies, `key=value` in free text, URLs and the `path` query |
-| `test_value_rules.py` | Card layouts, non-cards that must stay, cards stored as JSON numbers, credentials in URLs, rule order, unicode, regex speed |
-| `test_idempotency.py` | `redact(redact(x)) == redact(x)` over the whole sample file and per action |
-| `test_streaming.py` | Memory stays flat as the input grows; a huge line is never held in memory |
-| `test_fixtures.py` | Golden files: real sample lines in, hand-checked output out |
-| `test_cli.py` | The real command: files, stdin, flags, exit codes |
-| `test_service.py` | Cutting a chunked body into lines (any chunking gives the CLI's lines), the endpoints, output equal to the CLI's, a real server streaming both ways, refusing to start on bad rules |
-| `test_deploy.py` | The deployment files agree: the ConfigMap equals `rules.yaml`, the mount path is where `--rules` points, probes, ports, labels, image tag, non-root |
-| `test_known_gaps.py` | Known gaps written as strict expected failures (see [Known limitations](#known-limitations)) |
+| Rules and redaction | `test_rules` (every invalid config is rejected), `test_actions`, `test_engine`, `test_key_matching`, `test_value_rules`, `test_body_shapes` |
+| Robustness | `test_failures` (bad lines, deep nesting, invalid UTF-8), `test_streaming` (flat memory, huge lines), `test_jsonio` |
+| End to end | `test_fixtures` (golden files), `test_idempotency`, `test_cli`, `test_service` (including a real server streaming both ways) |
+| Deployment | `test_deploy`: the ConfigMap equals `rules.yaml`, the mount path, probes, ports, image tag, non-root |
+| Bonuses | `test_hmac` (key handling, no plain SHA-256 left, the key never printed), `test_reload` (valid, broken, deleted and unchanged rule files, a live CLI stream) |
+| Known gaps | `test_known_gaps`: strict expected failures (see [Known limitations](#known-limitations)) |
 
 ## Project layout
 
@@ -143,385 +121,226 @@ redactor/
   jsonio.py           JSON read/write that keeps numbers, repeated keys and odd characters intact
   engine.py           Redactor: one line in, one redacted line out. Knows nothing about files
   stream.py           line-by-line driver: line size limit, error records, summary
+  reload.py           --watch-rules: re-reads the rules file during a stream, swaps only valid rules
   service.py          HTTP service: POST /redact (streamed), GET /healthz
   cli.py              argument parsing, exit codes, starts the service with --serve
 tests/                pytest suite and golden fixtures
 Dockerfile            the service image
-.dockerignore         keeps everything but the code out of the image
-deploy/
-  configmap.yaml      rules.yaml as a ConfigMap (generated copy, checked by a test)
-  deployment.yaml     2 pods of the image, rules mounted, probes, limits, locked down
-  service.yaml        one stable in-cluster name and address for the pods
+deploy/               configmap.yaml, deployment.yaml, service.yaml
+docs/                 development-process.html: the development process, phase by phase
 ```
-
-The layers only depend downwards (cli → service/stream → engine → rules/actions/jsonio). The
-engine works on one string at a time. `stream.LineProcessor` turns one input line into one
-output line (error records, blank lines, UTF-8 repair, statistics), and both the CLI loop and
-the service feed it; only where the lines come from differs.
 
 ## Design decisions and trade-offs
 
 ### What the engine reads: "headers" and "body"
 
-A line is a transaction object with a `response` object inside it. Both are treated the same:
-
-- the `headers` field is walked with the **headers** scope;
-- **every other field** (`body`, `path`, `ts`, `method`, `status`, and any field I don't know
-  about) is walked with the **body** scope.
-
-The second point is *default deny*: if a line arrives with an unexpected top-level field like
-`"query": {"password": ...}`, it gets redacted instead of passed through because nobody listed
-it. Fields like `ts` and `status` simply contain nothing that matches.
-
-Anything decoded out of a string (JSON inside a string, a form body, a query string) is payload,
-so its keys use the body scope, even when the string sat in a header.
+In the transaction and in its `response`, the `headers` field is walked with the **headers**
+scope and **every other field** (`body`, `path`, fields I don't know about) with the **body**
+scope. An unexpected field like `"query": {"password": ...}` is still
+redacted. Anything decoded out of a string (embedded JSON, a form, a query) is payload, so it
+uses the body scope.
 
 ### Rule order and overlaps
 
-1. For each key in an object, the **first matching key rule** (in config order) wins, and its
-   action is applied to the whole value. Value rules don't run on that value, so a key rule and
-   a value rule never both count the same secret.
-2. Otherwise the value is walked, and every string goes through **all value rules in config
-   order**, each one working on the previous one's output.
+1. For each key, the **first matching key rule** wins and its action applies to the whole value.
+   Value rules don't run on that value, so one secret is never counted twice.
+2. Otherwise every string goes through **all value rules in config order**.
 
-Order matters where patterns overlap. `jwt` runs before `credit-card`, so digits inside a token
-are masked as part of the token and never mistaken for a card. `email` runs first, and its hash
-output contains no `@`, so later rules can't match inside it.
+Order matters where patterns overlap: `jwt` runs before `credit-card`, so digits inside a token
+aren't taken for a card, and `email` writes a hash with no `@`, so later rules can't match in it.
 
 ### Recursion
 
-The walker is a recursive function over the JSON tree: objects (key rules, then recurse),
-arrays (recurse), strings (decode or value rules), integers (value rules, see
-[Numbers](#numbers)), and other numbers, booleans and null (kept). Recursion mirrors the data's
-shape, which makes it short and easy to check.
-
-Its weakness is the call stack. Python allows about 1000 frames, and a hostile line like
-`[[[[...]]]]` 5000 levels deep used to crash the tool with `RecursionError`. Now there is an
-explicit limit, `MAX_DEPTH = 100` levels (real traffic rarely passes ~20). A deeper line becomes an
-error record (`nesting too deep`). `RecursionError` is also caught, both while parsing and as a
-backstop, so it can never escape. An explicit stack (a loop) would remove the limit entirely,
-but that would make the code harder to read, and no real log is 100 levels deep.
+The walker is a recursive function over the JSON tree: objects get key rules and then recurse,
+arrays recurse, strings are decoded or go through the value rules, and other values are kept.
+The recursion mirrors the data's shape, so the code is short and easy to check. Its weakness is
+the call stack: a hostile `[[[[...]]]]` 5000 levels deep used to crash with `RecursionError`.
+Now there's an explicit limit of **100 levels** (real traffic rarely passes ~20), and a deeper
+line becomes an error record. An explicit stack would remove the limit, but it makes the code
+harder to read for a case no real log has.
 
 ### Decoding nested encodings, and why it stops at 3
 
-The brief asks for secrets inside non-JSON bodies, so a string is inspected before value rules run:
+A string can hide another format inside it. Sample line 1's response `body` is the *string*
+`"{\"token\":\"...\"}"`: to the JSON parser it's just text, so the `token` key inside would never
+be seen. So before redacting a string, the engine checks what it contains, peels off one layer,
+and redacts what's inside:
 
-| The string is... | What happens |
+| The string is... | Example in → out |
 |---|---|
-| JSON (`{...}`, `[...]`, or a JSON string, i.e. double-encoded) | Parsed, walked like any other JSON, and written back, but **only if something was redacted**. Otherwise the original text is kept byte for byte. |
-| A URL with a query (`/v1/reset?token=...`) | The query is handled as a form. |
-| Form-encoded (`email=bob%40example.com&password=...`) | Each name/value is percent-decoded. Key rules match the name, value rules the decoded value. Only changed pairs are re-encoded. |
-| Anything else (plain text, HTML, logs) | Free text: `key=value` / `key: value` pairs whose key is a sensitive name are redacted, then the value rules run. |
+| JSON (starts with `{`, `[` or `"` and parses) | `{"password": "hunter2"}` → `{"password":"****"}` |
+| A URL with a query | `/v1/reset?token=abc123&lang=en` → `/v1/reset?token=****&lang=en` |
+| A form (`name=value&name=value`) | `email=bob%40example.com&password=hunter2` → `email=sha256:…&password=****` |
+| Anything else: free text | `login failed, password=hunter2` → `login failed, password=****` |
 
-In free text a key rule applies **whatever its scope**: `Authorization: Bearer ...` pasted
-into a body is still a credential, and we can't tell where the text came from.
+Only what was redacted changes. If nothing inside is secret, the original string is kept exactly,
+spaces included. In free text a key rule applies whatever its scope: `Authorization: Bearer ...`
+pasted into a body is still a credential.
 
-Decoding stops after **3 levels** (`MAX_DECODES`), for example a JSON string in a form field in
-a JSON string. "Decode as much as possible" sounds safer but isn't:
+**Why only these formats.** Each one is easy to recognise, and decoding then re-encoding it gives
+back the same text, so the output doesn't change where nothing was secret. base64 isn't decoded:
+almost any word is valid base64, so it would "find" encodings everywhere. gzip isn't either: a
+small gzip can expand to gigabytes (a decompression bomb).
 
-- each level is another full parse, and an attacker controls how many levels there are;
-- each extra decoder (base64, gzip, HTML entities...) adds false positives, because almost any
-  token "is" base64, and compressed data can be a decompression bomb;
-- whatever is decoded must be re-encoded exactly, or idempotency breaks.
-
-So I only decode formats that **announce themselves** and **round-trip losslessly** (JSON, form
-encoding, URL queries). Past the limit the engine **fails closed**: if there is still JSON
-inside, the line becomes an error record. It isn't passed through unread, because the inner
-quotes are escaped and even the free-text scan couldn't see the keys.
+**Why stop at 3 levels.** Real logs nest one or two levels (JSON inside a log record, maybe JSON
+inside a form field); anything deeper is most likely made on purpose. Past the limit the line
+**fails closed** and becomes an error record. It can't fall back to free text: each level escapes
+the quotes of the one inside, so at level 4 there are 15 backslashes between `password` and its
+value, and the free-text scan wouldn't recognise the key.
 
 ### Streaming
 
-Input is read as **bytes, one line at a time**, never the whole file. Each line is parsed fully,
-redacted, written, and dropped before the next is read.
+Input is read as **bytes, one line at a time**. Each line is parsed fully, redacted, written,
+and dropped before the next is read. A line is a small self-contained unit, so a full parse per
+line is simpler than a streaming JSON tokenizer. `--max-line-bytes` (default 1 MiB) caps one
+line: a longer one is read in chunks and thrown away, never held in memory, and replaced by a
+`line too long` error record.
 
-I parse each line fully instead of using a streaming JSON tokenizer because a line is a
-self-contained unit, usually a few KB. Holding one line as a tree makes key rules, repeated keys
-and rewriting embedded JSON straightforward. A tokenizer only pays off for single documents too
-big for memory, and the line size limit covers that case.
+**Complexity**, for *B* input bytes, *V* value rules and a longest line of *L* bytes:
 
-**One enormous line.** Without a limit, one 10 GB line would be read into memory whole.
-`--max-line-bytes` (default 1 MiB) caps it. A longer line is read in chunks and thrown away, so
-it never sits in memory, and it is replaced by a `line too long` error record.
-
-**Complexity**, for an input of *B* bytes, *V* value rules and a longest line of *L* bytes:
-
-- **Time: O(B × V).** Each byte is parsed once, and each string is scanned once per value rule.
-  Key-rule lookup is O(K) per key for *K* key rules (small and fixed). This holds only if
-  **every regex runs in linear time**, which Python's `re` doesn't guarantee (see below).
-- **Memory: O(L)**, independent of the input size. The parsed tree of one line is a constant
-  factor larger than the line. The per-rule counters are O(number of rules).
-
-Measured with a small local benchmark script (the sample file repeated, on my laptop, Python 3.12):
-
-| Lines | Input | Time | Throughput | Peak Python memory (tracemalloc) |
-|---|---|---|---|---|
-| 10,000 | 2.2 MB | | | 16 KiB |
-| 100,000 | 22 MB | | | 14 KiB |
-| 1,000,000 | 221 MB | 121 s | 8,239 lines/s, 1.8 MB/s, ~121 µs per line | |
-
-Ten times more input, the same memory: it's flat. The memory test in `test_streaming.py`
-checks the same thing on every test run. Throughput is where Python costs me. I haven't
-measured a Go version. A compiled one should be several times faster, and a worker pool would
-scale either one with cores.
-
-#### Regexes are part of the time complexity
-
-Python's `re` is a *backtracking* engine. How long a pattern takes depends on what the input
-looks like, not just on its length. Since the input is traffic someone else controls, a pattern
-that becomes slow on some input is a denial-of-service hole (often called ReDoS). I measured
-every rule on 14 kinds of hostile 1 MB bodies (long letter runs, base64, digits, `a:a:a:…`,
-`password=password=…`, …). Two of the provided patterns were quadratic.
-
-**Why the provided email pattern was O(n²).** The pattern starts with
-`[A-Za-z0-9._%+-]+@`. To find the leftmost match, `re` tries start position 0, then 1, then 2, and
-so on. Take a run of *n* letters with no `@`, for example a base64-encoded upload:
-
-- starting at position *i*, `[…]+` greedily takes the remaining *n − i* letters, finds no `@`,
-  and gives them back one by one, checking for an `@` each time: about *n − i* steps before it fails;
-- over all start positions that is *n + (n − 1) + … + 1 = n(n + 1)/2* steps, which is **O(n²)**.
-
-Measured: 5 KB took 44 ms, 10 KB 183 ms, 20 KB 715 ms. Each doubling of the input quadruples
-the time, the signature of O(n²). A single 1 MB line would take about half an hour.
-
-**The fix** is a lookbehind in front: `(?<![A-Za-z0-9._%+-])`, meaning "the character before
-this one can't be part of an address". It is checked in O(1) at each position and fails at
-every position *inside* a run, so only the first character of each run does the scan. Runs don't
-overlap, so the total is **O(n)**: 1 MB now takes 16 ms.
-
-**It finds exactly the same matches.** If an address ends at some `@`, the scan that starts at
-the first character of that run reaches the same `@`, and it is tried first, so the leftmost
-match always starts at a run's beginning. The positions the lookbehind skips could never have
-produced a match.
-
-**Can it be faster than O(n)?** Not asymptotically. A correct detector has to look at every
-character at least once, because any unread character could be the `@`. So Ω(n) is a lower
-bound, and the fixed pattern meets it. Only the constant factor could shrink. For example, a
-possessive quantifier (`[…]++`, Python 3.11+) skips the give-back walk and roughly halves the
-work per run. Without the lookbehind, though, that would still be O(n²), because every start
-position would still scan to the end of the run.
-
-| Rule | Hostile input | Before | Now |
-|---|---|---|---|
-| `email` | 20 KB of letters or base64, no `@` | 0.7 s (1 MB ≈ 30 min) | 1 MB in 16 ms (lookbehind) |
-| `jwt` | `eyJeyJeyJ…` | 60 KB in 2.3 s | 60 KB in 0.8 ms (lookbehind + possessive, see [The JWT report](#the-jwt-report)) |
-
-Every other rule grows linearly (1 MB of the worst shape takes under a second), and the tests
-time the worst cases so a regression shows up. Go's RE2 engine guarantees linear time by
-design, which is one real argument for Go here.
+- **Time: O(B × V)**, each string scanned once per value rule, but only if **every regex runs in
+  linear time**, which Python's `re` doesn't guarantee.
+- **Memory: O(L)**, independent of the input size.
 
 ### Rule matching
 
-- Every regex is **compiled once** when the rules load, never per line.
-- `exact` key names are compared **case-insensitively** (HTTP header names are case-insensitive).
-  `regex` key rules use `(?i)` and are **anchored** (`^...$`), so `password_hint`,
-  `passwordless`, `tokenizer` and `secret_santa` don't match.
-- A value rule can name a **validator**: a pure function that gets the matched text and
-  returns true/false. `luhn` rejects about 90% of random 16-digit numbers, which is why the order
-  reference `4111111111111112` and the timestamp `1705312800123456` survive. `luhn` counts
-  every Unicode digit, the same set the regex `\d` matches, so a card written in full-width
-  (`４１１１…`) or Arabic-Indic digits is checked and masked like any other. It used to read only
-  `0-9`, so such cards matched the regex, failed the check, and leaked. Adding a validator is
-  one function in `actions.py` plus one entry in `VALIDATORS`.
-- **Config errors fail at startup** (unknown action, scope or validator, bad regex, both or
-  neither of `exact`/`regex`, duplicate names): the tool exits with code 2 before reading a
-  line, so it can never run with rules it half understands.
+- Every regex is **compiled once** when the rules load.
+- `exact` key names are **case-insensitive** (like HTTP headers). `regex` key rules are
+  **anchored**, so `password_hint` and `tokenizer` don't match.
+- The `luhn` validator rejects about 90% of random 16-digit numbers, so order references and
+  timestamps survive. It counts every Unicode digit, like `\d` does, so a card in full-width
+  digits (`４１１１…`) is masked too.
+- **Config errors fail at startup** (unknown action, bad regex, duplicate names, ...): exit code
+  `2` before reading a line.
 
 ### Changes to rules.yaml
 
-The brief allows changing the config with a reason. All changes are in `rules.yaml` itself,
-none in code:
+The brief allows changing the config with a reason. All changes are in `rules.yaml`, none in code:
 
 | Change | Why |
 |---|---|
-| `credit-card` pattern now also matches cards printed in groups: 4-4-4-4, 4-6-5 (Amex), 4-6-4 (Diners), with spaces or dashes | `\b\d{13,19}\b` missed `4111 1111 1111 1111` and `5555-5555-5555-4444` (sample lines 1, 6, 36, 44). |
-| `pii-fields` key rule: `ssn`, `phone`, `dob` and similar names, mask | Sample line 37. A field *named* `phone` is a phone number, so matching on the name has almost no false positives. |
-| `url-credentials` value rule, `(?<=://)[^/\s:@]+:[^/\s@]+(?=@)`, mask, placed **before** `email` | `postgres://admin:hunter2@db:5432/app` leaked: no rule covered it. With a host like `db.internal` the email rule hashed `hunter2@db.internal` by accident, leaving the user name readable and the password open to guessing. Now the result is `postgres://****@db:5432/app`. The `://` lookbehind pins each match to the start of a URL, which also keeps it linear. A URL with only a user name (`https://user@host`) is left alone. |
-| `email` pattern gets the lookbehind `(?<![A-Za-z0-9._%+-])` | Same matches, but linear instead of quadratic time (see [Regexes are part of the time complexity](#regexes-are-part-of-the-time-complexity)). |
-| `jwt` pattern uses the base64url alphabet, a lookbehind and possessive quantifiers | The user report: base64url tokens leaked whole or in part (sample lines 11, 15, 16), and the pattern was quadratic. See [The JWT report](#the-jwt-report). |
+| `credit-card` also matches cards printed in groups (4-4-4-4, 4-6-5 Amex, 4-6-4 Diners), with spaces or dashes | `\b\d{13,19}\b` missed `4111 1111 1111 1111` (sample lines 1, 6, 36, 44). The pattern lists real layouts: a loose "digits with separators" pattern would start at a stray digit, fail Luhn, and let the real card leak. |
+| `pii-fields` key rule: `ssn`, `phone`, `dob` and similar names | Sample line 37. A field *named* `phone` is a phone number, so there are almost no false positives. |
+| `url-credentials` value rule, before `email` | `postgres://admin:hunter2@db:5432/app` leaked. Now `postgres://****@db:5432/app`. |
+| `email` gets a lookbehind | Same matches, linear instead of quadratic time. |
+| `jwt`: base64url alphabet, lookbehind, possessive quantifiers | The user report. See [The JWT report](#the-jwt-report). |
 
-Why the card pattern lists layouts instead of "digits with optional separators": a loose
-`(\d[ -]?){12,18}\d` on `"id 1 4111 1111 1111 1111"` starts matching at the `1`, takes 17
-digits, fails Luhn, and the real card leaks, because `re.sub` never retries a shorter match
-after the validator says no. Listing real layouts, plus the back-reference `\1` that requires
-the same separator throughout, avoids that.
+SSN and phone **value** rules weren't added: the brief's minimum doesn't list them, and they
+have real false-positive costs (see [What I'd do with more time](#what-id-do-with-more-time)).
 
-**Not added: SSN and phone value rules.** The brief asks to detect "at minimum: emails, JWTs,
-credit card numbers, and credentials in headers". SSNs and phones aren't on that list, so in
-free text they are a documented gap. Fields *named* `ssn` or `phone` are still masked by
-`pii-fields`. Both rules are in [What I'd do with more time](#what-id-do-with-more-time), with
-their trade-offs.
+### Numbers and non-string values
 
-### Numbers
+Value rules also read **integers**: `"amount": 4111111111111111` is still a card, so it becomes
+`"************1111"`, a string. The cost: Luhn passes about 10% of random numbers, so a 13–19
+digit ID can be redacted like a card. I chose leak safety over type stability.
 
-Value rules also read **integer** literals, as their digits. A card stored as a JSON number
-under a harmless key (`"amount": 4111111111111111`) is still a card, so it is redacted, and
-because `partial` produces text it becomes a string: `"************1111"`. Every number that
-isn't redacted keeps its type and exact text. Numbers with a sign, fraction or exponent
-(`-4111…`, `4111….0`, `1e3`) are left alone: a card is never written that way.
-
-The cost is false positives with a type change. Luhn accepts about 1 in 10 random numbers
-(measured: 10.1% of random 16-digit numbers), so an integer ID or timestamp of 13–19 digits
-has a 10% chance of being redacted like a card. Line 35's timestamp `1705312800123456` fails
-Luhn and stays a number; `1705312800123452` would become `"************3452"`. I chose leak
-safety over type stability here. A team that prefers the opposite could make this a config option.
-
-### Sensitive keys with non-string values
-
-| Value under a sensitive key | Result | Why |
-|---|---|---|
-| string | the action | |
-| number (`"card_number": 4111111111111111`) | the action on its text, so it becomes a string | `partial`/`hash` need text, and the digits must not survive |
-| `null`, `true`, `false` | kept | they contain no secret, and keeping them keeps the type |
-| array / object (`"Set-Cookie": ["a", "b"]`) | the action on every scalar inside, shape kept → `["****", "****"]` | downstream tools still see a list |
-| anything, with `remove` | the key is dropped | |
+Under a sensitive key, strings and numbers get the action, `null` and booleans are kept, and in
+an array or object every scalar inside gets the action, so the shape is kept (`["****", "****"]`).
 
 ### Failure handling
 
-A line that can't be processed (invalid JSON, valid JSON that isn't an object, too deep, too
-long) is replaced on stdout by an **error record**, and reported on stderr:
+A line that can't be processed (invalid JSON, not an object, nested deeper than 100 levels, too
+long) is replaced on stdout by an **error record** and reported on stderr:
 
 ```text
 stdout:  {"redactor_error":{"line":20,"reason":"invalid JSON"}}
 stderr:  redactor: line 20: invalid JSON
 ```
 
-| Option | Safety | Data loss | Downstream parsers |
-|---|---|---|---|
-| Pass the line through | ❌ leaks | none | may break |
-| Redact it as plain text | ⚠️ leaks what the rules can't see: line 20's half JWT, line 21's `user=` | low | may break |
-| Drop it silently | ✅ | **silent**: nobody downstream knows a line is missing | ✅ |
-| **Error record** (chosen) | ✅ contains no input | visible: says which line and why | ✅ still valid NDJSON |
+Why an error record: passing the line through could leak secrets, and dropping it silently would
+hide that data is missing. The record contains nothing from the input, says which line failed and
+why, and keeps the output valid NDJSON.
 
-**No leaks in errors.** The reason is always one of a **fixed set of strings**: `invalid JSON`,
-`not a JSON object`, `nesting too deep`, `line too long`, `internal error`. It is never
-`str(exception)`, because Python's error messages can quote the input (`UnicodeDecodeError`
-includes the offending bytes). There's no traceback either: an unexpected exception in one line
-becomes an `internal error` record and the stream goes on.
+The reason is always one of a **fixed set of strings**, never `str(exception)`, because Python's
+error messages can quote the input. An unexpected exception in one line becomes an
+`internal error` record, and the stream goes on.
 
-**Rules are all or nothing, checked before anything runs.** The brief says that if the rules
-can't be loaded, the service must not pass traffic through unredacted. So the rules are loaded
-and validated before the CLI reads a line or the service opens its port, and any problem exits
-with code `2`. "Can't be loaded" covers more than a missing or broken file. A file that parses
-but has **no rules** (`version: 1` alone, an empty ConfigMap), or a **misspelled section**
-(`key_rule:`, silently ignored before), would start a redactor that redacts nothing, which is
-the same leak. Both are refused too. A bad regex, action, scope or validator in any rule
-rejects the whole file: running with "the rules that did load" would quietly drop protection.
+**Rules are all or nothing, checked before anything runs.** The brief says the service must not
+pass traffic unredacted if the rules can't be loaded. So any problem exits with code `2` before
+the CLI reads a line or the service opens its port. "Can't be loaded" includes a file that
+parses but has **no rules**, or a **misspelled section** (`key_rule:`): both would start a
+redactor that redacts nothing. One bad rule rejects the whole file.
 
-Other choices:
-
-- A failed line's rule counts are **discarded**, so the summary only counts what was written.
-- **Blank lines** are skipped and counted, not reported as errors. NDJSON readers may skip them.
-- **Invalid UTF-8** bytes are replaced with U+FFFD and the line is still redacted. Replacing
-  only removes information, and stderr says which line.
-- `NaN`/`Infinity` are rejected as invalid JSON. Python accepts them, but other parsers don't.
+Blank lines are skipped and counted. Invalid UTF-8 is replaced with U+FFFD and the line is still
+redacted. `NaN` and `Infinity` are rejected as invalid JSON.
 
 ### Service mode: streaming both ways
 
-`POST /redact` never holds the whole body. uvicorn hands the body over in chunks as they
-arrive. `split_lines` cuts them into lines with the same rules as the CLI (the same 1 MiB limit,
-a too-long line dropped as it arrives), and each line is redacted and sent back right away. A
-test sends one line, waits for its redacted copy, and only then sends the next, over a raw
-socket against a real server. Memory per request is one line plus one chunk. If the client
-reads slowly, sending blocks, so we stop reading its body: TCP flow control does the rest, and
-nothing piles up.
+`POST /redact` never holds the whole body. uvicorn hands it over in chunks, `split_lines` cuts
+them into lines with the same 1 MiB limit as the CLI, and each line is redacted and sent back
+right away. If the client reads slowly, we stop reading its body, and TCP flow control does the
+rest. A test sends one line, waits for its redacted copy, and only then sends the next.
 
-- **Same output as the CLI.** Both feed the same `LineProcessor`, so error records, blank lines
-  and UTF-8 repair are identical. Tests compare the service's output with the CLI's on the whole
-  sample file, and on 20 random ways of cutting the same body into chunks.
-- **The redaction runs in a worker thread** (`asyncio.to_thread`), one batch (the lines of one
-  chunk) at a time. FastAPI runs every request on one event loop. Redacting is CPU work, and
-  done on the loop it would freeze every other request and `/healthz` until it finished.
-  Measured with 4 clients each sending 1 MB lines: `/healthz` took up to **2.5 s** with the
-  redaction on the loop and under **0.15 s** in a thread. The GIL still runs one thread's Python
-  at a time, so threads add responsiveness, not speed; more speed comes from more pods.
-- **Order is kept**: each batch is awaited before the next is read.
-- **One `Redactor` per request.** It holds the counts of the line it is working on, so sharing
-  one between concurrent requests would mix them up. The compiled rules are shared: nothing
-  changes them after loading.
-- **Errors can't change the status code.** By the time line 2 is read, `200` and line 1 have
-  already been sent. Bad lines become error records in the output, like in the CLI.
-- **Shutdown:** on SIGTERM (Kubernetes stopping a pod), uvicorn stops accepting connections and
-  lets running requests finish for up to 20 s, inside Kubernetes' 30 s grace period.
-
-**A bug found on the way.** Starlette's `StreamingResponse` (0.41, used by FastAPI 0.115) runs a
-"has the client disconnected?" listener next to the response. It reads from the same channel as
-the request body and throws away everything that isn't a disconnect. When the body is still
-arriving while the response streams, which is exactly this endpoint, the listener swallowed
-the body chunks. A client uploading in pieces got back an **empty** response: no leak, but
-silently lost lines. A whole body sent at once worked, so a simple test wouldn't have shown it.
-`BodyStreamingResponse` in `service.py` sends without that listener, so only our code reads the
-body. A disconnect is still noticed, because reading the body raises `ClientDisconnect`. The
-streaming test fails (times out) with Starlette's original class.
+- **The redaction runs in a worker thread** (`asyncio.to_thread`). Every request shares one event
+  loop, so CPU work on the loop would freeze every other request and `/healthz`. Measured with 4
+  clients sending 1 MB lines: `/healthz` took up to **2.5 s** with the work on the loop, under
+  **0.15 s** in a thread.
+- **One `Redactor` per request**, since it holds per-line counts. The compiled rules are shared.
+- **The status is always `200`.** It's sent before line 2 is read; bad lines become error records.
 
 ### Idempotency
 
-`redact(redact(x)) == redact(x)`, tested over the whole sample file. `mask`, `partial` and
-`remove` already have this property (masking `****` gives `****`). `hash` doesn't:
-`sha256(sha256(x)) ≠ sha256(x)`. Before this was fixed, five sample lines changed on a second run.
-
-The fix makes hash output **recognisable**: it is written as `sha256:<64 hex>`. A hash rule
-leaves a value alone if it is already a hash, or is the mask string left by an earlier
-redaction (sample line 12 has `"X-Api-Key":"****"`, and hashing `****` would pretend there was
-a real key). I didn't use "any 64-hex string" as the test, because a real secret can be 64 hex
-characters, and skipping it would leak it.
-
-The decoders are stable too: embedded JSON is only rewritten if something changed, and our
-compact output reads back to the same text. Form pairs are only re-encoded if they changed.
+`redact(redact(x)) == redact(x)`, tested over the whole sample file. `hash` alone wasn't stable,
+since hashing a hash gives a new value. Hash output is now written as `sha256:<64 hex>` (or
+`hmac-sha256:<64 hex>` with `--hmac`), and a hash rule leaves a value alone if it is already a
+hash or a mask.
 
 ### Hashing: is SHA-256 safe?
 
-The brief defines `hash` as "the SHA-256 of the value", and `rules.yaml` says
-`algorithm: sha256`, so that's what the tool does. But plain SHA-256 is **not** safe for
-cards or emails. SHA-256 can't be reversed, but it can be *guessed forwards*, and these inputs
-come from small spaces:
+The brief and `rules.yaml` say SHA-256, so that's the default. But plain SHA-256 can be
+*guessed forwards*: anyone can hash `bob@example.com` and look for the result in the logs. A
+card has only about 10⁵ unknown candidates once the bank prefix, the last 4 digits and the Luhn
+digit are known, a fraction of a second to try them all.
 
-- a 16-digit card has 6 known bank-prefix digits, 4 digits often shown elsewhere (`partial`
-  shows them!) and 1 Luhn check digit, leaving about 10⁵ candidates, a fraction of a second on a laptop;
-- emails can be tried from leaked email lists or guessed for a specific target.
+**`--hmac` (bonus)** fixes that with **HMAC-SHA256**: a hash that mixes in a secret key. The same
+value still gives the same output, so you can still see that two lines belong to the same user,
+but without the key nobody can hash a guess and compare. The key:
 
-The fix I'd make with more time is **HMAC-SHA256 with a secret key** (from a Kubernetes Secret).
-Equal inputs still give equal outputs, so analysts can still correlate "same user", but without
-the key nobody can test guesses. The costs are key management, and rotating the key breaks
-correlation with older logs.
+- comes from the environment variable `REDACTOR_HMAC_KEY`, never from `rules.yaml` (it's in git)
+  or the command line (shell history and `ps` would show it);
+- must be at least 32 bytes (as long as the hash itself), or the tool refuses to start;
+- is never printed: not in errors, and not in the settings' `repr`.
 
-### Output format
+**In Kubernetes** (not wired up here), it would take three small changes. First, a **Secret**
+holding the key: a Secret is like a ConfigMap, but meant for passwords and keys, kept out of git,
+and access to it can be limited. Second, an environment variable in `deployment.yaml` filled from
+that Secret (`valueFrom: secretKeyRef`). Third, `--hmac` added to the container's args. The cost
+of HMAC: if the key is ever changed, new hashes no longer match old ones.
 
-The output is the same JSON, written compactly on one line. Compared to the input:
+### Hot reload of the rules (bonus, CLI)
 
-- **kept:** key order, every number literal exactly as written (`10.50`, `1e3`,
-  `12345678901234567890`), repeated keys (`json.loads` would silently keep only the last one,
-  sample line 25), non-ASCII text as readable UTF-8;
-- **changed:** whitespace between tokens (removed), and escapes may be written differently
-  (a non-ASCII character escaped in the input as backslash-u plus four hex digits is written as
-  the character itself, e.g. `ÿ`; same string);
-- **lone surrogates** (`"\ud800"`, valid JSON text but not valid UTF-8) are kept as `\u`
-  escapes. Writing them raw used to crash the output stream.
+`--watch-rules` is for long-running streams, like `tail -f app.log | redactor --watch-rules`.
+Stopping the stream to change a rule would mean restarting where you left off, so instead:
 
-#### Why `jsonio.py` exists
+- Before each line, at most every 2 seconds, the tool reads the rules file again.
+- If the content changed and the **new rules are valid**, they're used from the next line on. A
+  line is never redacted half with the old rules and half with the new ones.
+- If the new rules are **invalid** (broken YAML, no rules, an unknown action) or the file is
+  gone, the tool **keeps the old rules** and writes a warning to stderr, once. It never runs with
+  no rules, the same "fail closed" as at startup.
+- In this mode every output line is flushed right away, so a reader sees it at once.
 
-A redactor should change the secrets and nothing else: the rest of the log should look exactly
-as the redactor received it. Python's `json` doesn't do that. A plain `json.loads` then
-`json.dumps` rewrites `10.50` as `10.5` and `1e3` as `1000.0`, keeps only the last value of a
-repeated key (`{"a":1,"a":2}` becomes `{"a":2}`), and accepts `NaN`, which isn't JSON.
+The check runs when a line arrives, so an idle stream costs nothing, and new rules are always
+in place before the next line is redacted.
 
-`jsonio.py` is not a parser of its own. The parsing is still done by the standard library's
-`json.JSONDecoder` (its C scanner), with four hooks: numbers are kept as their original text,
-an object with a repeated key is kept as a list of pairs (objects without one stay plain
-dicts), and `NaN`/`Infinity` are rejected. A matching writer (about 30 lines) writes numbers
-back as that text and writes repeated keys back in order.
+**Why only the CLI.** In Kubernetes, the service reads its rules once at startup, and a change
+needs `kubectl rollout restart`. Kubernetes does update the file of a mounted ConfigMap inside a
+running pod by itself (within about a minute), so the same watcher could run in the service as a
+background task. I kept it to the CLI for now: in the service, a failed reload would also need to
+be visible from outside (in `/healthz` or a metric), which is more to design and test.
 
-I checked the libraries first. `orjson`, `ujson` and `rapidjson` parse into floats and dicts,
-so they lose the same things. `simplejson` with `use_decimal` keeps `10.50` but rewrites `1e3`
-as `1E+3`, and repeated keys would still need a custom writer. None of them gives "change some
-strings, write the rest back as it was", and each would be an extra dependency.
+### Output format and `jsonio.py`
 
-The brief doesn't require this (plain `json` would also be idempotent), so it's a choice, and
-it has a cost. Measured on the sample lines: reading takes 4.7 µs per line instead of 3.0, since
-the parser is still C, but the writer is pure Python, 20.9 µs instead of 4.6. That's about 18 of
-the ~105 µs per line, roughly 17%. The complexity is the same, O(L) per line; only the
-constant changes. I kept it, because a log that's changed in places that weren't secrets is
-harder to trust. The cost can be cut without giving up the fidelity (see
-[What I'd do with more time](#what-id-do-with-more-time)).
+A redactor should change the secrets and nothing else. The output keeps key order, every number
+exactly as written (`10.50`, `1e3`), and repeated keys; only whitespace is removed. Python's
+`json` can't do that: a round trip rewrites `10.50` as `10.5` and `1e3` as `1000.0`, keeps only
+the last of a repeated key, and accepts `NaN`, which isn't JSON.
+
+`jsonio.py` isn't a parser of its own. It uses the standard library's C decoder with hooks, plus
+a writer of about 30 lines. I checked `orjson`, `ujson`, `rapidjson` and `simplejson` first, and
+none keeps all of this. The cost is about 17% of the time per line, because the writer is pure
+Python. The complexity is the same. I kept it, because a log that changed in places that weren't
+secrets is harder to trust.
 
 ## The JWT report
 
@@ -540,8 +359,8 @@ as we can see in the lines (output of the provided rules):
 there is a problem with the JWT rule, the regex doesnt cover the whole JWT cases and causes leaks.
 To fix that we need to change the rule of the JWT to include all of the possible options.
 
-Lines 11 and 16 leak the **whole** token, line 15 leaks the end of its signature. The per-rule
-summary showed it too: `jwt 2`, both on line 15. Lines 11 and 16 weren't matched at all.
+Lines 11 and 16 leak the **whole** token, and line 15 leaks the end of its signature. The
+per-rule summary showed it too: `jwt 2`, both on line 15.
 
 ### Root cause: two bugs in one pattern
 
@@ -549,21 +368,15 @@ summary showed it too: `jwt 2`, both on line 15. Lines 11 and 16 weren't matched
 pattern: 'eyJ[A-Za-z0-9+/=]+\.[A-Za-z0-9+/=]+\.[A-Za-z0-9+/=]*'
 ```
 
-**1. Wrong alphabet (the leak).** A JWT is three parts joined by dots, each **base64url**
-encoded (RFC 7515): the alphabet is `A-Z a-z 0-9 - _`, with no `=` padding. The class
-`[A-Za-z0-9+/=]` is plain base64 (`+ /` instead of `- _`). About one base64url character in 32
-is a `-` or `_`, so most real tokens contain one, and the match stops there:
+**1. Wrong alphabet (the leak).** A JWT is three **base64url** parts joined by dots (RFC 7515):
+`A-Z a-z 0-9 - _`, no `=` padding. `[A-Za-z0-9+/=]` is plain base64, so the match stops at the
+first `-` or `_`, and most real tokens have one. In the **signature** (line 15) the match just
+ends early and the tail leaks. In the **payload** (lines 11 and 16) the `\.` after it can't
+match, so nothing is masked at all.
 
-- `_` in the **signature** (line 15): the pattern still matches up to the `_` and masks that
-  much, so `****_adQssw5c` leaks the tail.
-- `_` in the **payload** (lines 11 and 16, `eyJhIjoiPz8_In0`): the second part stops at the `_`,
-  the `\.` that must follow can't match, and the whole pattern fails. Nothing is masked.
-
-**2. Quadratic time (the same shape as the email bug in
-[Regexes are part of the time complexity](#regexes-are-part-of-the-time-complexity)).** On
-`eyJeyJeyJ…`, `re` tries a match at every `eyJ`. From each one, `[…]+` runs to the end of the
-text, finds no `.`, and gives the characters back one by one: *n* starts × O(*n*) = O(n²). 60 KB
-took 2.3 s. Fixing the alphabet alone doesn't change this (2.26 s, measured).
+**2. Quadratic time.** On `eyJeyJeyJ…`, `re` retries from every `eyJ` and scans to the end each
+time. 60 KB took 2.3 s, and fixing the alphabet alone
+didn't change that.
 
 ### The fix (only `rules.yaml` changed)
 
@@ -573,74 +386,58 @@ pattern: '(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]++\.[A-Za-z0-9_-]++\.[A-Za-z0-9_-]*+
 
 | Part | Why |
 |---|---|
-| `[A-Za-z0-9_-]` | the base64url alphabet, from the spec. I first kept `+/=` too, "to be safe", and that broke `token=eyJ…`: with `=` in the class, the lookbehind below saw `=` as part of the run and refused the match. |
-| `(?<![A-Za-z0-9_-])` | a token may start only where a run of base64url characters starts. On `eyJeyJ…` only the first `eyJ` is tried; every other position fails this O(1) check. |
-| `++` (possessive) | once taken, characters are never given back, so a failed attempt costs one pass, not a give-back walk. Python 3.11+, which `pyproject.toml` requires. |
-| `*+` on the last part | an unsigned token (`alg: none`) has an empty third part and must still be masked. |
+| `[A-Za-z0-9_-]` | The base64url alphabet, from the spec. Keeping `+/=` "to be safe" broke `token=eyJ…`, because the lookbehind then saw `=` as part of the token. |
+| `(?<![A-Za-z0-9_-])` | A token may only start where a run starts, so on `eyJeyJ…` only the first `eyJ` is tried. |
+| `++` (possessive) | Characters are never given back, so a failed attempt costs one pass. |
+| `*+` on the last part | An unsigned token (`alg: none`) has an empty signature. |
 
-| | Before | After |
-|---|---|---|
-| Lines 11, 15, 16 | 2 whole tokens leaked, 1 tail leaked | all `****` |
-| `jwt` count on `input.ndjson` | 2 | 4 |
-| 60 KB of `eyJeyJ…` | 2.3 s | 0.8 ms |
-
-The engine didn't change: the rules are config, so the fix is config. In Kubernetes it ships as
-a ConfigMap update and a rollout restart, with no new image.
-
-**Tests.** The three expected-failure tests in `tests/test_known_gaps.py` now pass and became
-normal tests in `tests/test_value_rules.py`: the tokens from lines 11, 15 and 16, a token after
-`=` and in quotes, an unsigned token, look-alikes that must stay (`keyJSON.a.b`, a token with
-only two parts), and three hostile shapes of 300 to 500 KB that must each take under a second. The golden
-file `tests/fixtures/sample_expected.ndjson` now covers the whole of `input.ndjson`. Before the
-fix it skipped lines 11, 15 and 16, so it couldn't bless a leak.
 
 ### Why not a detector in code instead of a regex
 
-I could replace the rule with a Python function: find `eyJ`, base64url-decode the header, and
-check that it is JSON with an `alg` field. I kept the regex:
+A Python function could decode the header and check for an `alg` field. I kept the regex:
 
-- **The brief makes rules config.** The report is about `rules.yaml`, and a config bug fixed in
-  config means no engine change and no new image. A code detector would also make `jwt` the one
-  rule a user can't read or change in `rules.yaml`.
-- **For a redactor, a miss is worse than a false mask.** The decode check exists to reject
-  look-alikes, but it would also reject what we most need to catch: a token that an upstream
-  logger cut short, or one with a damaged header. That would be a leak. A false mask costs a little
-  readability. Text shaped like `eyJ….….…` is almost never anything but a JWT anyway: `eyJ` is
-  `{"` in base64.
-- **The cost is the same.** Both are one linear pass. The decoder adds a base64 decode and a
-  JSON parse per candidate.
+- **Rules are config.** The report is about `rules.yaml`, and a code detector would be the one
+  rule nobody can read or change there.
+- **A miss is worse than a false mask.** The decode check would reject a token cut short by
+  an upstream logger, and that's a leak. Text shaped like `eyJ….….…` is almost always a JWT
+  anyway (`eyJ` is `{"` in base64).
+- **No speed gain.** Both are one linear pass.
 
 ### The trade-off: a JWT glued to a word isn't matched
 
-The lookbehind lets a token start only where a run of base64url characters starts. For the
-email rule that loses nothing (see
-[Regexes are part of the time complexity](#regexes-are-part-of-the-time-complexity)), because any character of a run
-can be part of the address, so the leftmost match always starts at the run's beginning. A JWT is
-different: it starts with the fixed text `eyJ`, and that can sit *inside* a run.
+A *run* is a stretch of characters that could all belong to a token: letters, digits, `-` and
+`_`. It ends at a space, a quote, `.`, `=` or `:`. The lookbehind says a JWT may only **start at
+the first character of a run**:
 
-In `jwt_eyJhbGci….….…`, `_` is a base64url character, so the run starts at `j`. The `eyJ` has `_`
-before it, the lookbehind refuses, and the token isn't masked at all. The provided pattern had
-no lookbehind, so it didn't have this blind spot, only the bigger ones above. The same goes for a
-token glued to a letter, a digit or `-`.
+| Text | Character before `eyJ` | Result |
+|---|---|---|
+| `Bearer eyJ…`, `"eyJ…"`, `token=eyJ…` | a space, a quote, `=` | masked |
+| `jwt_eyJ…` | `_`, a token character | **not masked** |
 
-The alternatives I measured:
+**Why the rule is needed.** On `eyJeyJeyJ…` (60 KB), without it the regex tries a match at
+every one of the 20,000 `eyJ`s, and each try scans to the end of the text looking for a dot:
+about a billion steps, 2.3 s. With the rule, every `eyJ` after the first has a `J` before it and
+is skipped at once, so the text is scanned once: 0.8 ms.
 
-| Option | `jwt_eyJ…` | Hostile input | Price |
-|---|---|---|---|
-| **Lookbehind on all of base64url** (chosen) | not masked | linear (0.8 ms) | glued tokens leak |
-| Lookbehind on letters and digits only | masked | `_eyJ_eyJ…`: 80 KB in 1.2 s, **quadratic again** | a DoS hole |
-| Match the whole run if it contains `eyJ` | masked, together with `jwt_` | linear | false masks: `keyJSON.a.b` is masked, since "keyJSON" contains `eyJ` |
+**Why email didn't lose anything from the same rule.** An address can start with any character
+of its run, so the match starts at the run's beginning anyway. A JWT must start with exactly
+`eyJ`, so in `jwt_eyJ…` there's no allowed place to start.
 
-I chose the first. In real traffic a JWT follows a space, a quote, `=`, `:` or `Bearer `, never a
-base64url character, and a slow pattern in a service is an outage for everyone. The trade-off is
-listed under [Known limitations](#known-limitations) with a strict expected-failure test
-(`test_jwt_glued_to_a_word`), so it can't be fixed or broken silently. If glued tokens turn up
-in production, the third option is the fix: a slightly wider mask instead of a leak.
+| Option | `jwt_eyJ…` | Problem |
+|---|---|---|
+| **Token start only at a run's first character** (chosen) | not masked | a glued token leaks |
+| Also allow `_` and `-` before `eyJ` | masked | an attacker sends `_eyJ_eyJ…` and it's slow again (80 KB in 1.2 s) |
+| Mask any run that contains `eyJ` | masked, with `jwt_` | normal words get masked: `keyJSON.a.b` contains e-y-J |
+
+I chose the first. In real logs a JWT comes after a space, a quote, `=`, `:` or `Bearer `, never
+glued to a word, while a slow pattern can be triggered on purpose and slows down everyone using
+the service. The gap is documented and has a test, `test_jwt_glued_to_a_word`. If glued tokens
+ever show up, the third option is the fix.
 
 ## Deployment
 
-Four small files: a `Dockerfile` and three manifests in `deploy/`. I kept them to what the
-service needs and what I can explain. Every choice is also commented in the files themselves.
+A `Dockerfile` and three manifests in `deploy/`, kept to what the service needs. Every choice
+is also commented in the files.
 
 ```sh
 docker build -t redactor:0.1.0 .
@@ -651,150 +448,89 @@ kubectl rollout status deployment/redactor
 kubectl port-forward service/redactor 8080:80    # then curl localhost:8080 as above
 ```
 
-I ran exactly this on kind (v0.33). The output through the Service, from a pod inside the
-cluster, was byte-for-byte the CLI's output on the sample file.
-
 ### Dockerfile
 
 | Choice | Why |
 |---|---|
-| `python:3.12.7-slim-bookworm` | Official image, slim (no compilers or docs), the exact version the tests ran on, so every build starts the same. |
-| Copy only `pyproject.toml` and `redactor/` (+ `.dockerignore` that excludes everything else) | No tests, `.git` or personal notes in any image layer. Smaller context, faster builds. |
-| `pip install --no-cache-dir .` with pinned dependencies | Same versions as the tests. No pip cache left in the image. |
-| `USER 10001` (no root) | If the process were ever taken over, it has no privileges in the container. |
-| Rules **not** copied in | They come from a ConfigMap at `/etc/redactor/rules.yaml`. Without them the container exits with code `2` instead of starting. |
-| `ENTRYPOINT ["redactor"]`, `CMD [--serve ...]` | Exec form: the process is PID 1 and receives SIGTERM directly, so graceful shutdown works. The CMD can be overridden to use the CLI. |
-| `PYTHONUNBUFFERED`, `PYTHONDONTWRITEBYTECODE` | Logs appear immediately in `kubectl logs`; no `.pyc` writes on a read-only filesystem. |
-
-Single stage, on purpose: there is nothing to compile, so a multi-stage build would save
-little. The image is 214 MB, nearly all of it the Python base image.
+| `python:3.12.7-slim-bookworm` | Official, slim, the exact version the tests ran on. |
+| Copy only `pyproject.toml` and `redactor/`, plus a `.dockerignore` | No tests, `.git` or notes in the image. |
+| `USER 10001` (not root) | If the process were taken over, it has no privileges. |
+| Rules **not** copied in | They come from a ConfigMap. Without them the container exits with code `2`. |
+| Exec-form `ENTRYPOINT ["redactor"]` | The process is PID 1 and gets SIGTERM directly, so graceful shutdown works. |
 
 ### Kubernetes
 
-**`configmap.yaml`: the rules.** Rules are config, not code, so changing them needs no new
-image. The file is generated from `rules.yaml` by `kubectl create configmap ... --dry-run`
-(the command is in its header), and `tests/test_deploy.py` fails if the two differ. The service
-reads the rules once at startup, so after changing them: `kubectl rollout restart
-deployment/redactor` (hot reload is a bonus I didn't do).
+**`configmap.yaml`: the rules.** Generated from `rules.yaml` by `kubectl create configmap ...
+--dry-run` (the command is in its header), and `test_deploy.py` fails if the two differ. The
+rules are read at startup, so a change needs `kubectl rollout restart deployment/redactor`.
 
-**`deployment.yaml`: runs the pods.**
+**`deployment.yaml`: the pods.**
 
 | Choice | Why |
 |---|---|
-| `replicas: 2` | One pod can crash or be replaced while the other serves. A rolling update replaces them one at a time. |
-| Image tag `0.1.0`, never `latest` | Every pod runs the same known build; `test_deploy.py` checks it matches `pyproject.toml`. |
+| `replicas: 2` | One pod can crash or be replaced while the other serves. |
+| Image tag `0.1.0`, never `latest` | Every pod runs the same known build. |
 | Readiness and liveness probes on `/healthz` | See [Health endpoint](#health-endpoint). |
-| Requests `100m` CPU, `64Mi` memory | What the scheduler reserves. Idle, the process uses 32 MiB. |
-| Limit `256Mi` memory | A hard ceiling, so a runaway pod is restarted instead of starving its node. Measured: 8 clients sending 1 MB lines at once peaked at 153 MiB (~15 MiB per line in flight). |
-| No CPU limit | Going over the CPU request only slows a pod down (throttling); it's never fatal. One Python process uses at most about one core anyway (GIL). |
-| `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drop all capabilities | The service only reads its rules and talks HTTP. Anything else it could do is attack surface. Tested: it runs fine read-only. |
-| Rules mounted read-only at `/etc/redactor` | The path `--rules` points to (checked by a test). |
+| Requests `100m` CPU / `64Mi`, limit `256Mi` memory | Idle uses 32 MiB; 8 clients with 1 MB lines peaked at 153 MiB. Over the limit the pod restarts instead of starving its node. |
+| No CPU limit | Going over only slows the pod down, and one Python process uses about one core anyway. |
+| `runAsNonRoot`, read-only filesystem, no privilege escalation, all capabilities dropped | It only reads its rules and talks HTTP; anything else is attack surface. |
 
-**`service.yaml`: one stable address.** Pods come and go and change IPs. The Service gives them
-one name, `http://redactor/redact` on port 80 inside the cluster, and forwards each connection
-to a ready pod's port 8080. `ClusterIP` (the default) keeps it reachable from inside the cluster
-only: raw logs with secrets in them shouldn't cross the public internet.
-
-**Fail closed, tested on kind.** I deployed three kinds of bad rules on purpose:
-
-| What I broke | What happened |
-|---|---|
-| Invalid YAML in the ConfigMap | New pod: `CrashLoopBackOff`, never ready |
-| A ConfigMap with no rules (`version: 1`) | New pod: "refusing to run without redaction", `CrashLoopBackOff` |
-| ConfigMap deleted | New pod can't mount its volume (`FailedMount`), never starts |
-
-In all three, the rolling update stopped and the old pods kept serving with the good rules
-they had loaded, so a request through the Service was still redacted. On a fresh install
-with bad rules there are no ready pods at all: callers get connection errors, never
-unredacted data.
+**`service.yaml`: one stable address.** Pods come and go; the Service gives them one name,
+`http://redactor` on port 80. `ClusterIP` keeps it inside the cluster: raw logs with secrets
+shouldn't cross the internet.
 
 ### Health endpoint
 
-`GET /healthz` returns `200 {"status":"ok"}`. Kubernetes uses it for both probes, and that's
-enough here because of how startup works:
-
-- **Readiness** ("send me traffic?"): the port only opens after the rules have loaded and been
-  validated. So if `/healthz` answers at all, this pod can redact. A pod with bad rules never
-  answers and never gets traffic.
-- **Liveness** ("restart me?"): `/healthz` is answered by the event loop. If the loop got stuck,
-  the probe would fail 3 times (30 s) and Kubernetes would restart the container. Because the
-  redaction runs in threads, a busy pod still answers in milliseconds, so busy isn't mistaken
-  for stuck.
-
-A deeper check (redact a test line on every probe) would only test code that already ran at
-startup, and would cost CPU on every probe. Separate `/readyz` and `/livez` endpoints would make
-sense with hot reload, where the rules could change while the pod is running.
+`GET /healthz` returns `200 {"status":"ok"}`, used for both probes. **Readiness:** the port
+only opens after the rules loaded, so a pod that answers can redact. **Liveness:** the event loop
+answers it, and since redaction runs in threads, a busy pod still answers in milliseconds and
+isn't mistaken for a stuck one.
 
 ## Known limitations
 
-Each leak below has a strict expected-failure test in `tests/test_known_gaps.py`. If one gets
-fixed, its test fails until the marker is removed, so this list can't silently go stale.
+Most leaks below have a strict expected-failure test in `tests/test_known_gaps.py`.
 
-- **A JWT glued to a letter, digit, `_` or `-`** (`jwt_eyJ…`) isn't masked. This is the price
-  of a linear `jwt` rule (see [the trade-off](#the-trade-off-a-jwt-glued-to-a-word-isnt-matched)).
-- **Percent-encoding and HTML entities inside a sentence** aren't decoded:
-  `see email=gina%40example.com for details` and `<p>alice&#64;example.com</p>` keep the email.
-  Percent-encoding *is* decoded when the whole string is a form body or a URL. Decoding single
-  words inside prose would work, but it costs: a rewritten word can't keep its exact original
-  encoding, you can never cover every encoding (double encoding, mixes), and it's more code. The
-  brief asks for form and plain-text bodies, which are covered, so this is planned only after
-  everything else (see [What I'd do with more time](#what-id-do-with-more-time)).
-- **base64** isn't decoded (see [decoding](#decoding-nested-encodings-and-why-it-stops-at-3)).
-- **SSNs and phone numbers in free text** aren't detected (no value rules, see
-  [Changes to rules.yaml](#changes-to-rulesyaml)). Fields named `ssn` / `phone` are masked.
-- **Cards with mixed separators** (`4111 1111-1111 1111`) and **19-digit cards printed in
-  groups** aren't matched.
+- **A JWT glued to a letter, digit, `_` or `-`** (`jwt_eyJ…`) isn't masked (see
+  [the trade-off](#the-trade-off-a-jwt-glued-to-a-word-isnt-matched)).
+- **Percent-encoding and HTML entities inside a sentence** aren't decoded
+  (`see email=gina%40example.com`). A whole form body or URL *is* decoded.
+- **base64** isn't decoded: it can't be told apart from ordinary tokens.
+- **SSNs and phone numbers in free text** aren't detected. Fields *named* `ssn` or `phone` are.
+- **Cards with mixed separators** (`4111 1111-1111 1111`) aren't matched.
 - **Names, addresses and dates of birth in free text** can't be found by a regex.
-- **Free-text `key=value` detection** stops a bare value at whitespace, so
-  `password=correct horse` only masks `correct`, and `phone: +1 (415) 555-0132` only masks
-  `+1`. Quoted values are masked whole.
-- **Over-redaction** is possible: any word after a sensitive key name followed by `:` or `=` in
-  free text is masked, and an integer of 13–19 digits that happens to pass Luhn is redacted like
-  a card (see [Numbers](#numbers)).
-- **Embedded JSON that gets rewritten** loses its original spacing (only when something in it was redacted).
+- **A bare value in free text ends at a space**: `password=correct horse` masks only `correct`.
+  Quoted values are masked whole.
+- **Over-redaction** is possible: any word after a sensitive key name in free text is masked, and
+  an integer that passes Luhn is redacted like a card.
 
-Service and deployment:
-
-- **No limit on concurrent requests per pod.** Each request in flight with a 1 MB line costs
-  about 15 MiB, so roughly 14 at once fit in the 256 MiB limit. More, and the pod is killed
-  (OOM) and restarted; its in-flight requests fail, but nothing leaks.
-- **No TLS or authentication** on the endpoint. It is reachable only inside the cluster
-  (`ClusterIP`), but any pod in the cluster can call it.
-- **Changing rules needs a restart** of the pods (`kubectl rollout restart`).
-- The ConfigMap is a **generated copy** of `rules.yaml`. A test catches drift, but someone has to
-  regenerate it.
+Service: there is **no limit on concurrent requests** (about 14 requests with 1 MB lines fill the
+256 MiB limit, then the pod restarts, without leaking), **no TLS or authentication** (it is
+only reachable inside the cluster), and **changing rules needs a pod restart** (`--watch-rules`
+is CLI only). The deployment hashes with plain SHA-256: `--hmac` isn't wired up there.
 
 ## What I'd do with more time
 
-- HMAC-SHA256 instead of plain SHA-256 (see [Hashing](#hashing-is-sha-256-safe)).
-- **An SSN value rule**, `\b\d{3}-\d{2}-\d{4}\b`. The 3-2-4 dash shape is rare elsewhere (dates
-  are 4-2-2, US phones 3-3-4), so false positives are few: an order or part number written
-  `555-12-3456` would be masked. It misses SSNs written with spaces or none, because allowing
-  those would hit every 9-digit ID. A small validator could reject impossible SSNs (area 000,
-  666 or 9xx, group 00, serial 0000), like Luhn does for cards.
-- **A phone value rule** limited to numbers that start with `+` and a country code (IDs rarely
-  do), with a validator for 8–15 digits (the international E.164 maximum). That would also
-  catch the rest of `phone: +1 (415) 555-0132`. Local formats like `0541234567` would still be
-  missed. Matching every phone shape would also match timestamps, dates and order numbers.
-- **Decoding single words in free text**: percent-encoding and HTML entities (see
-  [Known limitations](#known-limitations)).
-- **A faster writer in `jsonio.py`**: parts of a line with no numbers and no repeated keys
-  could be handed to the C `json.dumps`, and only the parts that have them would go through the
-  Python writer. That keeps the output identical and wins back most of the ~17% (see
-  [Why `jsonio.py` exists](#why-jsoniopy-exists)).
-- **Bound the memory per pod**: a cap on requests in flight (a semaphore around the redaction,
-  `503` beyond it) so the memory limit can never be reached, plus a HorizontalPodAutoscaler to
-  add pods under load instead.
-- **Hot-reload of the rules** (a brief bonus): watch the mounted file, load and validate the new
-  rules, and swap them in only if they're valid. Bad new rules would keep the old ones running,
-  never none. Readiness and liveness would then get separate endpoints.
-- **Prometheus metrics** (a brief bonus): the per-rule counts and error reasons already exist in
-  the summary; exposing them on `/metrics` is mostly wiring.
-- **mTLS or a NetworkPolicy** so only the services that should send logs can reach the redactor.
+- **The two bonuses in Kubernetes**: the HMAC key from a Secret (see
+  [Hashing](#hashing-is-sha-256-safe)), and the rules watcher in the service, with failed
+  reloads reported on `/healthz`.
+- **SSN and phone value rules** with validators: `\b\d{3}-\d{2}-\d{4}\b` for SSNs, and only
+  `+`-prefixed international numbers for phones, to keep false positives on IDs and dates low.
+- **A faster `jsonio` writer**: hand the parts with nothing special to the C `json.dumps`.
 
 ## Running inline with a sub-millisecond budget
 
-<!-- One paragraph: "If this had to run inline on live production traffic with a sub-millisecond budget per request, what would you change?" -->
+Claude measured the numbers, the results are: the redaction itself takes about 120 µs per line, but an HTTP round trip to the service costs about 0.9 ms before any work is done, so the first change is where it runs. I'd make the redactor a library where the traffic is handled and not a separate service so the setup work done once and not every request.
+
+If a request still can't be redacted in time (for example a very big body), I wouldn't let it
+through unredacted, and I wouldn't slow the system down either. What we protect is the log copy,
+not the live request, so the request continues as it is, and in the log its body is replaced by a
+placeholder, like the error records the tool already writes. The headers are still redacted,
+because checking them is fast.
+
+Other thing I'd do is rewrite it in Go. Go is compiled to machine code ahead of time, while
+Python interprets the code as it runs, so the same work takes several times less CPU. Go's regex
+engine always runs in linear time so the slowest requests stay close to the average ones, which is what a hard
+budget per request needs.
 
 ## Assumptions
 
