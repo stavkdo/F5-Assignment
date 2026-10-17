@@ -35,8 +35,10 @@ class KeyRule:
     exact: frozenset[str]  # lower-cased names; empty when the rule uses a regex
     regex: re.Pattern | None
 
-    def matches(self, key: str, scope: str) -> bool:
-        if self.scope != "any" and self.scope != scope:
+    def matches(self, key: str, scope: str | None) -> bool:
+        # scope=None means "wherever": used for key=value pairs in free text, where we can't
+        # tell whether the pair came from a header or a body field.
+        if scope is not None and self.scope != "any" and self.scope != scope:
             return False
         if self.regex is not None:
             return self.regex.search(key) is not None

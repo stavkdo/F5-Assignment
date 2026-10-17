@@ -13,24 +13,24 @@ def body_of(redactor, body):
 # --- value rules on a single string -------------------------------------------------
 
 def test_email_in_sentence_is_hashed(redactor):
-    out = redactor._redact_string("contact dave@example.com today")
+    out = body_of(redactor, "contact dave@example.com today")
     assert out == f"contact {sha256('dave@example.com')} today"
     assert redactor.counts["email"] == 1
 
 
 def test_card_in_sentence_is_partially_masked(redactor):
-    assert redactor._redact_string("order 4111111111111111 paid") == "order ************1111 paid"
+    assert body_of(redactor, "order 4111111111111111 paid") == "order ************1111 paid"
     assert redactor.counts["credit-card"] == 1
 
 
 def test_non_luhn_number_is_untouched(redactor):
     text = "order ref 4111111111111112 was shipped"
-    assert redactor._redact_string(text) == text
+    assert body_of(redactor, text) == text
     assert redactor.counts["credit-card"] == 0
 
 
 def test_two_matches_in_one_string_are_both_counted(redactor):
-    out = redactor._redact_string("a@x.com and b@x.com")
+    out = body_of(redactor, "a@x.com and b@x.com")
     assert out == f"{sha256('a@x.com')} and {sha256('b@x.com')}"
     assert redactor.counts["email"] == 2
 
@@ -101,8 +101,9 @@ def test_body_scoped_rule_does_not_fire_in_headers(redactor):
     assert out["headers"] == {"token": "abc"}
 
 
-def test_key_rule_on_whole_nested_value(redactor):
-    assert body_of(redactor, {"token": {"a": 1}}) == {"token": "****"}
+def test_key_rule_on_nested_value_masks_each_leaf(redactor):
+    # Phase 3b: the structure is kept, every scalar under the key is redacted.
+    assert body_of(redactor, {"token": {"a": 1, "b": ["x"]}}) == {"token": {"a": "****", "b": ["****"]}}
 
 
 # --- whole record -------------------------------------------------------------------
@@ -114,9 +115,15 @@ def test_response_headers_and_body_are_redacted(redactor):
     assert out["response"] == {"status": 200, "headers": {"Set-Cookie": "****"}, "body": {"email": sha256("x@y.com")}}
 
 
-def test_metadata_fields_are_passed_through(redactor):
+def test_metadata_fields_without_secrets_are_unchanged(redactor):
     record = {"ts": "2025-01-15T10:00:00Z", "method": "GET", "path": "/v1/me"}
     assert redactor.redact_record(record) == record
+
+
+def test_unknown_top_level_fields_are_redacted_too(redactor):
+    # Default deny: a field the engine doesn't know is walked as body data, not passed through.
+    out = redactor.redact_record({"user": "a@b.com", "query": {"password": "x"}})
+    assert out == {"user": sha256("a@b.com"), "query": {"password": "****"}}
 
 
 def test_redact_line_sample_line_1(redactor):

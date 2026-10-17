@@ -40,19 +40,40 @@ key_rules:
       regex: '(?i)^(cvv|cvc|cvv2)$'
     action: remove
 
+  # Personal data the provided rules didn't cover (input line 37). Matching on the key name
+  # has almost no false positives: a field called "ssn" is an SSN.
+  - name: pii-fields
+    scope: body
+    match:
+      regex: '(?i)^(ssn|social_security_number|phone|phone_number|mobile|dob|date_of_birth)$'
+    action: mask
+
 # value_rules match on the CONTENT of any string value, whatever its key is called.
 #   validator (optional): the match only counts if the validator accepts it. Supported: luhn
 value_rules:
+  # user:password inside a URL, e.g. postgres://admin:hunter2@db:5432/app -> postgres://****@db:5432/app.
+  # It runs before email, which would otherwise see "hunter2@db.internal" as an address and hash it,
+  # leaving the user name visible. The lookbehind "://" pins each match to the start of the URL.
+  - name: url-credentials
+    pattern: '(?<=://)[^/\s:@]+:[^/\s@]+(?=@)'
+    action: mask
+
+  # The lookbehind lets a match start only at the beginning of a run of local-part characters.
+  # Without it the regex retries from every position of a long run with no "@" (a base64 body,
+  # say), rescanning to its end each time: O(n^2), about 0.7 s for 20 KB. The matches are the same.
   - name: email
-    pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    pattern: '(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
     action: hash
 
   - name: jwt
     pattern: 'eyJ[A-Za-z0-9+/=]+\.[A-Za-z0-9+/=]+\.[A-Za-z0-9+/=]*'
     action: mask
 
+  # 13-19 digits written together, or a card printed in groups: 4-4-4-4 (Visa, Mastercard,
+  # Discover), 4-6-5 (Amex) or 4-6-4 (Diners). The back-references \1 and \2 require the same
+  # separator throughout, so "1234 5678-9012 ..." isn't glued into one number.
   - name: credit-card
-    pattern: '\b\d{13,19}\b'
+    pattern: '\b(?:\d{13,19}|\d{4}([ -])\d{4}\1\d{4}\1\d{4}|\d{4}([ -])\d{6}\2\d{4,5})\b'
     validator: luhn
     action: partial
 

@@ -1,33 +1,20 @@
-"""Known problems in the basic redactor, written as tests that currently fail.
+"""Known gaps, written as tests that currently fail.
 
-Each test states the behaviour we want. They are marked xfail(strict=True): pytest reports
+Each test states the behaviour we'd want. They are marked xfail(strict=True): pytest reports
 them as "expected failures" today, and turns them into real failures the moment one starts
-passing, so the marker gets removed together with the fix. The phase in each reason
-refers to TASKS.md.
+passing, so the marker gets removed together with the fix. Every gap here is listed under
+"Known limitations" in the README. The phase in each reason refers to TASKS.md.
 """
-
-import json
 
 import pytest
 
-from redactor.engine import LineError
+from conftest import redact_body
 
 
 def gap(phase, reason):
     return pytest.mark.xfail(strict=True, reason=f"{phase}: {reason}")
 
-
-def redact_body(redactor, body):
-    return redactor.redact_line(json.dumps({"body": body}))
-
-
-# --- secrets that leak through ------------------------------------------------------
-
-@gap("3d", "card regex \\b\\d{13,19}\\b does not allow spaces or dashes")
-@pytest.mark.parametrize("card", ["4111 1111 1111 1111", "5555-5555-5555-4444", "3782 822463 10005"])
-def test_card_with_separators_is_redacted(redactor, card):
-    assert card not in redact_body(redactor, f"please charge {card} today")
-
+# --- the JWT report (fixed in its own commit, Phase 3f) -------------------------------
 
 @gap("3f", "jwt pattern uses base64 (+/=) but JWTs use base64url (-_)")
 @pytest.mark.parametrize("secret_part", ["_adQssw5c", "dBjftJeZ4CVP"])
@@ -38,52 +25,44 @@ def test_base64url_jwt_is_fully_redacted(redactor, secret_part):
     )
     assert secret_part not in redact_body(redactor, text)
 
+@gap("3f", "jwt pattern retries from every 'eyJ' and rescans to the end: O(n^2) on hostile input")
+def test_jwt_rule_is_linear_on_hostile_input(redactor):
+    import time
 
-@gap("3c", "a string body that contains JSON is not decoded, so key rules never see its keys")
-@pytest.mark.parametrize("secret", ["abc123", "p@ssw0rd!"])
-def test_json_inside_string_body_is_redacted(redactor, secret):
-    body = '{"token":"abc123","password":"p@ssw0rd!"}'
-    assert secret not in redact_body(redactor, body)
-
-
-@gap("3c", "form-encoded bodies are treated as plain text")
-@pytest.mark.parametrize("secret", ["hunter2", "bob%40example.com"])
-def test_form_encoded_body_is_redacted(redactor, secret):
-    assert secret not in redact_body(redactor, "email=bob%40example.com&password=hunter2&remember=on")
+    start = time.perf_counter()
+    redact_body(redactor, "eyJ" * 20_000)  # 60 KB: about 2.5 s today, milliseconds once fixed
+    assert time.perf_counter() - start < 0.5
 
 
-@gap("3c", "key=value pairs inside free text are not recognised")
-def test_password_in_free_text_is_redacted(redactor):
-    assert "hunter2" not in redact_body(redactor, {"debug": "login attempt password=hunter2 for user=zed"})
+# --- accepted limitations (documented, not planned) ----------------------------------
+
+@gap("limit", "percent-encoding is only decoded in a whole form body or URL, not inside a sentence")
+def test_percent_encoded_email_in_a_sentence(redactor):
+    assert "gina%40example.com" not in redact_body(redactor, "reset sent, see email=gina%40example.com for details")
 
 
-@gap("3c", "the path field is passed through untouched")
-@pytest.mark.parametrize("secret", ["abc123def456", "gina%40example.com"])
-def test_query_string_in_path_is_redacted(redactor, secret):
-    out = redactor.redact_line('{"method":"GET","path":"/v1/reset?token=abc123def456&email=gina%40example.com"}')
-    assert secret not in out
+@gap("limit", "HTML entities are not decoded")
+def test_html_entity_encoded_email(redactor):
+    assert "example.com" not in redact_body(redactor, "<p>alice&#64;example.com</p>")
 
 
-# --- robustness ---------------------------------------------------------------------
+@gap("limit", "base64 is not decoded: it can't be told apart from ordinary tokens")
+def test_base64_encoded_password(redactor):
+    # base64 of {"pw":"hunter2"}
+    assert "eyJwdyI6Imh1bnRlcjIifQ" not in redact_body(redactor, "payload eyJwdyI6Imh1bnRlcjIifQ==")
 
-@gap("3a", "json.loads raises RecursionError, which is not caught, so the tool crashes")
-def test_deeply_nested_line_does_not_crash(redactor):
-    line = '{"body":' + "[" * 5000 + "]" * 5000 + "}"
-    try:
-        redactor.redact_line(line)
-    except LineError:
-        pass  # reporting the line as bad is fine; crashing is not
+@gap("limit", "no phone-number value rule: too many false positives on IDs and timestamps")
+def test_phone_number_in_free_text(redactor):
+    assert "555-0132" not in redact_body(redactor, "call me at +1 (415) 555-0132")
 
+@gap("limit", "a bare value in free text ends at the first space")
+def test_phone_after_a_sensitive_key_in_free_text(redactor):
+    assert "555-0132" not in redact_body(redactor, "phone: +1 (415) 555-0132")
 
-# --- correctness --------------------------------------------------------------------
+@gap("limit", "no SSN value rule: SSN detection is not in the brief (planned, see README)")
+def test_ssn_in_free_text(redactor):
+    assert "123-45-6789" not in redact_body(redactor, "customer ssn is 123-45-6789")
 
-@gap("3e", "hash is applied again to an already hashed value")
-def test_redacting_twice_gives_the_same_output(redactor):
-    once = redactor.redact_line('{"headers":{"X-Api-Key":"sk_live_abc123"}}')
-    assert redactor.redact_line(once) == once
-
-
-@gap("3d", "json.loads + json.dumps rewrite number literals")
-@pytest.mark.parametrize("literal", ["10.50", "1e3"])
-def test_number_literals_survive_unchanged(redactor, literal):
-    assert f'"amount":{literal}' in redactor.redact_line(f'{{"body":{{"amount":{literal}}}}}')
+@gap("limit", "the card pattern needs one kind of separator throughout")
+def test_card_with_mixed_separators(redactor):
+    assert "1111-1111" not in redact_body(redactor, "card 4111 1111-1111 1111")

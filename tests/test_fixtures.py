@@ -1,13 +1,11 @@
-"""Golden-file test: real sample lines in, hand-checked redacted lines out.
+"""Golden-file tests: real sample lines in, hand-checked redacted lines out.
 
 basic_input.ndjson holds the happy-path lines 2, 3, 5, 7, 9, 26, 27, 32, 40, 46, 47, 48 and 49
-of input.ndjson. basic_expected.ndjson is what the redactor must print for them.
+of input.ndjson (Phase 2). sample_input.ndjson is the whole of input.ndjson except lines 11,
+15 and 16, whose JWTs still leak until the Phase 3f fix: a golden file must not bless a leak.
 """
 
-import io
-
-from conftest import ROOT
-from redactor.cli import redact_stream
+from conftest import ROOT, run_stream
 
 FIXTURES = ROOT / "tests" / "fixtures"
 
@@ -17,18 +15,16 @@ def read_lines(name):
 
 
 def test_basic_fixture_matches_expected_output(redactor):
-    out, err = io.StringIO(), io.StringIO()
-    stats = redact_stream(redactor, read_lines("basic_input.ndjson"), out, err)
-
+    out, err, stats = run_stream(redactor, (FIXTURES / "basic_input.ndjson").read_bytes())
     expected = read_lines("basic_expected.ndjson")
-    assert out.getvalue().splitlines() == expected
-    assert stats == {"read": len(expected), "written": len(expected), "skipped": 0}
-    assert err.getvalue() == ""
+    assert out == expected
+    assert (stats.read, stats.redacted, sum(stats.errors.values())) == (len(expected), len(expected), 0)
+    assert err == ""
 
 
 def test_basic_fixture_counts(redactor):
-    redact_stream(redactor, read_lines("basic_input.ndjson"), io.StringIO(), io.StringIO())
-    assert dict(redactor.counts) == {
+    run_stream(redactor, (FIXTURES / "basic_input.ndjson").read_bytes())
+    assert +redactor.counts == {
         "auth-headers": 1,
         "api-key-names": 3,
         "secret-fields": 6,
@@ -36,4 +32,33 @@ def test_basic_fixture_counts(redactor):
         "email": 9,
         "credit-card": 5,
         "api-key-prefix": 1,
+    }
+
+
+def test_sample_fixture_matches_expected_output(redactor):
+    out, err, stats = run_stream(redactor, (FIXTURES / "sample_input.ndjson").read_bytes())
+    assert out == read_lines("sample_expected.ndjson")
+    assert (stats.read, stats.redacted, stats.blank) == (47, 40, 2)
+    assert dict(stats.errors) == {"invalid JSON": 3, "not a JSON object": 2}
+    assert err.splitlines() == [
+        "redactor: line 17: invalid JSON",
+        "redactor: line 18: invalid JSON",
+        "redactor: line 20: not a JSON object",
+        "redactor: line 21: not a JSON object",
+        "redactor: line 47: invalid JSON",
+    ]
+
+
+def test_sample_fixture_counts(redactor):
+    run_stream(redactor, (FIXTURES / "sample_input.ndjson").read_bytes())
+    assert +redactor.counts == {
+        "auth-headers": 9,
+        "api-key-names": 7,
+        "secret-fields": 13,
+        "card-number-fields": 7,
+        "cvv-fields": 1,
+        "pii-fields": 3,
+        "email": 30,
+        "credit-card": 16,
+        "api-key-prefix": 2,
     }

@@ -24,9 +24,9 @@ def broken(change):
 
 def test_provided_rules_file_loads(rules):
     assert [r.name for r in rules.key_rules] == [
-        "auth-headers", "api-key-names", "secret-fields", "card-number-fields", "cvv-fields",
+        "auth-headers", "api-key-names", "secret-fields", "card-number-fields", "cvv-fields", "pii-fields",
     ]
-    assert [r.name for r in rules.value_rules] == ["email", "jwt", "credit-card", "api-key-prefix"]
+    assert [r.name for r in rules.value_rules] == ["url-credentials", "email", "jwt", "credit-card", "api-key-prefix"]
     assert rules.settings.mask == "****"
     assert rules.settings.keep_last == 4
 
@@ -41,6 +41,12 @@ def test_exact_match_is_case_insensitive():
     assert auth.matches("authorization", "headers")
     assert auth.matches("AUTHORIZATION", "headers")
     assert not auth.matches("Authorization", "body")  # wrong scope
+
+
+def test_scope_none_matches_any_scope():
+    # Used for key=value pairs in free text, where the scope is unknown.
+    auth = parse_rules(VALID).key_rules[0]
+    assert auth.matches("Authorization", None)
 
 
 @pytest.mark.parametrize("change, message", [

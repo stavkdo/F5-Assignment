@@ -1,6 +1,10 @@
 """The redaction actions and validators, as small pure functions."""
 
 import hashlib
+import re
+
+HASH_PREFIX = "sha256:"
+_HASH_TOKEN = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def mask(value: str, replacement: str = "****") -> str:
@@ -15,7 +19,14 @@ def partial(value: str, keep_last: int = 4, fill: str = "*") -> str:
 
 
 def sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    # The "sha256:" prefix makes the output recognisable, so a second run can leave it alone
+    # instead of hashing the hash (see is_hash and the engine's idempotency check).
+    return HASH_PREFIX + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def is_hash(text: str) -> bool:
+    """True if text is exactly what sha256() produces."""
+    return _HASH_TOKEN.fullmatch(text) is not None
 
 
 def remove(value: str) -> str:
@@ -25,7 +36,9 @@ def remove(value: str) -> str:
 
 def luhn(text: str) -> bool:
     """True if the digits in text pass the Luhn checksum. Spaces and dashes are ignored."""
-    digits = [int(c) for c in text if c in "0123456789"]
+    # isdecimal() accepts every Unicode digit (full-width, Arabic-Indic, ...), the same set the
+    # regex \d matches, and int() converts any of them: int("４") == 4.
+    digits = [int(c) for c in text if c.isdecimal()]
     if not digits:
         return False
     total = 0

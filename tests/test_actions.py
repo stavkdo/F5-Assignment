@@ -1,6 +1,6 @@
 import pytest
 
-from redactor.actions import luhn, mask, partial, remove, sha256
+from redactor.actions import is_hash, luhn, mask, partial, remove, sha256
 
 
 def test_mask_replaces_whole_value():
@@ -22,7 +22,14 @@ def test_partial_hides_short_values_completely(value):
 
 
 def test_sha256_known_digest():
-    assert sha256("a@b.com") == "fb98d44ad7501a959f3f4f4a3f004fe2d9e581ea6207e218c4b02c08a4d75adf"
+    assert sha256("a@b.com") == "sha256:fb98d44ad7501a959f3f4f4a3f004fe2d9e581ea6207e218c4b02c08a4d75adf"
+
+
+def test_is_hash_recognises_only_exact_hash_output():
+    assert is_hash(sha256("anything"))
+    assert not is_hash("fb98d44ad7501a959f3f4f4a3f004fe2d9e581ea6207e218c4b02c08a4d75adf")  # no prefix
+    assert not is_hash(sha256("x") + " ")
+    assert not is_hash("sha256:" + "A" * 64)  # upper case is not what sha256() writes
 
 
 def test_remove_returns_empty_string():
@@ -35,6 +42,7 @@ def test_remove_returns_empty_string():
     "378282246310005",      # Amex
     "4111 1111 1111 1111",  # separators are ignored
     "5555-5555-5555-4444",
+    "４１１１１１１１１１１１１１１１",  # full-width digits count as digits
 ])
 def test_luhn_accepts_valid_numbers(number):
     assert luhn(number)
